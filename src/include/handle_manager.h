@@ -38,7 +38,7 @@ struct backup_handle
     pthread_t backup_thread;
     pthread_mutex_t backup_mutex;
 
-    THREAD_STATE backup_thread_state;
+    volatile THREAD_STATE backup_thread_state;   /* read by drain for EOF classification */
 
     bool is_cancel;
 

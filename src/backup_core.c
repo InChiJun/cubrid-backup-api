@@ -1,5 +1,10 @@
 #include <sys/wait.h>
 #include <errno.h>
+#include <poll.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/eventfd.h>
 #include "backup_api.h"
 #include "backup_core.h"
 #include "backup_manager.h"
@@ -505,6 +510,15 @@ int open_fifo (HANDLE_TYPE handle_type, void* handle)
             PRINT_LOG_ERR (ERR_INFO);
             goto error;
         }
+
+        /* Size the kernel pipe buffer (backupdb writes in ~1MB chunks). Applied
+         * on the read end before backupdb opens the write end. Best-effort:
+         * on failure keep the default size and continue — never fail the backup. */
+        if (fcntl (backup_handle->fifo_fd, F_SETPIPE_SZ,
+                   backup_mgr->default_backup_option.fifo_size) == -1)
+        {
+            PRINT_LOG_WARN ("F_SETPIPE_SZ failed; using default pipe size\n");
+        }
     }
     else
     {
@@ -941,6 +955,286 @@ error:
     pthread_exit (NULL);
 }
 
+/* ───────────────────────── tiered buffer (Phase 1: memory tier) ───────────────────────── */
+
+static
+size_t mem_ring_free (BACKUP_HANDLE* h)
+{
+    return h->mem_cap - h->mem_len;
+}
+
+/* Copy oldest-first out of the memory ring into out[0..cap). Caller holds buf_lock. */
+static
+size_t mem_ring_pop (BACKUP_HANDLE* h, char* out, size_t cap)
+{
+    size_t n, first;
+
+    n = (cap < h->mem_len) ? cap : h->mem_len;
+
+    if (n == 0)
+    {
+        return 0;
+    }
+
+    first = h->mem_cap - h->mem_head;   /* contiguous run from head to end */
+    if (first > n)
+    {
+        first = n;
+    }
+
+    memcpy (out, h->mem_buf + h->mem_head, first);
+
+    if (n > first)                      /* wrap to buffer start */
+    {
+        memcpy (out + first, h->mem_buf, n - first);
+    }
+
+    h->mem_head = (h->mem_head + n) % h->mem_cap;
+    h->mem_len -= n;
+
+    return n;
+}
+
+/* Mark the buffer path failed and wake both waiters. Caller must NOT hold buf_lock. */
+static
+void buf_mark_error (BACKUP_HANDLE* h)
+{
+    pthread_mutex_lock (&h->buf_lock);
+    h->buf_error = true;
+    pthread_cond_broadcast (&h->not_empty);
+    pthread_cond_broadcast (&h->not_full);
+    pthread_mutex_unlock (&h->buf_lock);
+}
+
+/* Resolve a FIFO read()==0 into normal EOF vs early/abnormal EOF. Keyed on
+ * backup_thread_state, but cancel also ends in THREAD_STATE_EXIT, so is_cancel
+ * must independently force an error. Caller must NOT hold buf_lock. */
+static
+void drain_classify_eof (BACKUP_HANDLE* h)
+{
+    bool err = true;
+    int  tries = 0;
+
+    for (;;)
+    {
+        THREAD_STATE st = h->backup_thread_state;
+
+        if (h->is_cancel || h->stop)
+        {
+            err = true;
+            break;
+        }
+
+        if (st == THREAD_STATE_EXIT)
+        {
+            err = false;                     /* clean end */
+            break;
+        }
+
+        if (st == THREAD_STATE_EXIT_WITH_ERROR)
+        {
+            err = true;                      /* backupdb crashed/failed */
+            break;
+        }
+
+        if (++tries > 200)                   /* ~2s fail-safe if state never publishes */
+        {
+            err = true;
+            break;
+        }
+
+        {
+            struct pollfd p;
+            p.fd = h->cancel_efd;
+            p.events = POLLIN;
+            p.revents = 0;
+            poll (&p, 1, 10);
+            if (p.revents != 0)              /* cancel arrived while waiting */
+            {
+                err = true;
+                break;
+            }
+        }
+    }
+
+    pthread_mutex_lock (&h->buf_lock);
+    if (err)
+    {
+        h->buf_error = true;
+    }
+    else
+    {
+        h->producer_eof = true;
+    }
+    pthread_cond_broadcast (&h->not_empty);
+    pthread_mutex_unlock (&h->buf_lock);
+}
+
+/* Drain thread: continuously read the FIFO into the tiered buffer so the pipe
+ * stays empty and backupdb never blocks/spins in the LOG_CS window. */
+static
+void* drain_backup_fifo (void* arg)
+{
+    BACKUP_HANDLE* h = (BACKUP_HANDLE *)arg;
+
+    sigset_t block_set;
+    struct pollfd fds[2];
+
+    /* Keep SIGCHLD steered to backup_thread's sigtimedwait(); if delivered here
+     * the child would never be reaped and EOF never detected. */
+    sigemptyset (&block_set);
+    sigaddset (&block_set, SIGCHLD);
+    pthread_sigmask (SIG_BLOCK, &block_set, NULL);
+
+    for (;;)
+    {
+        char*  dst;
+        size_t room, tail, contig, avail;
+        ssize_t n;
+
+        fds[0].fd = h->fifo_fd;    fds[0].events = POLLIN; fds[0].revents = 0;
+        fds[1].fd = h->cancel_efd; fds[1].events = POLLIN; fds[1].revents = 0;
+
+        if (poll (fds, 2, -1) < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            buf_mark_error (h);
+            break;
+        }
+
+        if (fds[1].revents != 0 || h->stop)        /* cancel / shutdown */
+        {
+            break;
+        }
+
+        pthread_mutex_lock (&h->buf_lock);
+
+        while (mem_ring_free (h) == 0 && !h->stop)  /* Tier-3 WAIT (backpressure) */
+        {
+            h->wait_cnt++;
+            pthread_cond_wait (&h->not_full, &h->buf_lock);
+        }
+
+        if (h->stop)
+        {
+            pthread_mutex_unlock (&h->buf_lock);
+            break;
+        }
+
+        /* reserve the contiguous free run [tail..end); drain owns it until commit */
+        tail   = (h->mem_head + h->mem_len) % h->mem_cap;
+        contig = h->mem_cap - tail;
+        avail  = h->mem_cap - h->mem_len;
+        room   = (contig < avail) ? contig : avail;
+        dst    = h->mem_buf + tail;
+
+        pthread_mutex_unlock (&h->buf_lock);
+
+        n = read (h->fifo_fd, dst, room);           /* lock-free: region is drain-private */
+
+        if (n < 0)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+            {
+                continue;
+            }
+            buf_mark_error (h);
+            break;
+        }
+
+        if (n == 0)
+        {
+            /* EOF from kernel. Spurious if backupdb has not opened the write end
+             * yet (state still RUNNING/NO_SPAWN) — wait briefly and retry. */
+            THREAD_STATE st = h->backup_thread_state;
+
+            if (st == THREAD_STATE_EXIT || st == THREAD_STATE_EXIT_WITH_ERROR || h->is_cancel)
+            {
+                drain_classify_eof (h);
+                break;
+            }
+
+            {
+                struct pollfd p;
+                p.fd = h->cancel_efd;
+                p.events = POLLIN;
+                p.revents = 0;
+                poll (&p, 1, 20);                    /* avoid busy-spin before writer connects */
+            }
+
+            if (h->stop)
+            {
+                break;
+            }
+
+            continue;
+        }
+
+        pthread_mutex_lock (&h->buf_lock);
+        h->mem_len += (size_t) n;
+        h->bytes_total += n;
+        if (h->mem_len > h->hw_mem)
+        {
+            h->hw_mem = h->mem_len;
+        }
+        pthread_cond_signal (&h->not_empty);
+        pthread_mutex_unlock (&h->buf_lock);
+    }
+
+    /* final wake so a parked reader observes producer_eof/buf_error/stop */
+    pthread_mutex_lock (&h->buf_lock);
+    pthread_cond_broadcast (&h->not_empty);
+    pthread_cond_broadcast (&h->not_full);
+    pthread_mutex_unlock (&h->buf_lock);
+
+    return NULL;
+}
+
+/* Reader side: pop oldest-first from the tiered buffer (replaces FIFO-direct
+ * read when buffering is enabled). Preserves the is_backup_end/return contract. */
+static
+int pop_backup_data (BACKUP_HANDLE* h, char* buffer, unsigned int buffer_size,
+                     unsigned int* data_len, bool* is_backup_end)
+{
+    size_t copied;
+
+    pthread_mutex_lock (&h->buf_lock);
+
+    while (h->mem_len == 0 && h->disk_len == 0 && !h->producer_eof && !h->buf_error)
+    {
+        pthread_cond_wait (&h->not_empty, &h->buf_lock);
+    }
+
+    if (h->buf_error)
+    {
+        pthread_mutex_unlock (&h->buf_lock);
+        PRINT_LOG_ERR (ERR_INFO);
+        return FAILURE;
+    }
+
+    if (h->mem_len == 0 && h->disk_len == 0 && h->producer_eof)
+    {
+        *is_backup_end = true;
+        *data_len = 0;
+        pthread_mutex_unlock (&h->buf_lock);
+        return SUCCESS;
+    }
+
+    copied = mem_ring_pop (h, buffer, buffer_size);
+    /* Phase 2 (disk tier): if (copied < buffer_size && h->disk_len > 0)
+     *     copied += disk_ring_pop (h, buffer + copied, buffer_size - copied); */
+
+    *data_len = (unsigned int) copied;
+
+    pthread_cond_signal (&h->not_full);
+    pthread_mutex_unlock (&h->buf_lock);
+
+    return SUCCESS;
+}
+
 int begin_backup (CUBRID_BACKUP_INFO* backup_info, void** handle)
 {
     BACKUP_HANDLE* backup_handle;
@@ -983,6 +1277,63 @@ int begin_backup (CUBRID_BACKUP_INFO* backup_info, void** handle)
 
         PRINT_LOG_ERR (ERR_INFO);
         goto error;
+    }
+
+    /* ── tiered buffer setup (best-effort: on any failure degrade to the legacy
+     * direct-FIFO read path via buffering_enabled=false — never fail begin) ── */
+    if (backup_mgr->default_backup_option.buffer_memory_size > 0)
+    {
+        backup_handle->mem_cap = (size_t) backup_mgr->default_backup_option.buffer_memory_size;
+        backup_handle->mem_buf = malloc (backup_handle->mem_cap);
+
+        if (backup_handle->mem_buf == NULL)
+        {
+            PRINT_LOG_WARN ("buffer_memory_size alloc failed; buffering disabled\n");
+            backup_handle->mem_cap = 0;
+        }
+        else
+        {
+            backup_handle->cancel_efd = eventfd (0, EFD_NONBLOCK | EFD_CLOEXEC);
+
+            if (backup_handle->cancel_efd == -1)
+            {
+                PRINT_LOG_WARN ("eventfd failed; buffering disabled\n");
+                free (backup_handle->mem_buf);
+                backup_handle->mem_buf = NULL;
+                backup_handle->mem_cap = 0;
+            }
+            else
+            {
+                sigset_t block_set, old_set;
+                int rc;
+
+                /* start the drain with SIGCHLD blocked so it never steals the
+                 * child-exit signal from backup_thread's sigtimedwait(). */
+                sigemptyset (&block_set);
+                sigaddset (&block_set, SIGCHLD);
+                pthread_sigmask (SIG_BLOCK, &block_set, &old_set);
+
+                rc = pthread_create (&backup_handle->drain_thread, NULL,
+                                     drain_backup_fifo, (void *)backup_handle);
+
+                pthread_sigmask (SIG_SETMASK, &old_set, NULL);
+
+                if (IS_FAILURE (rc))
+                {
+                    PRINT_LOG_WARN ("drain thread create failed; buffering disabled\n");
+                    close (backup_handle->cancel_efd);
+                    backup_handle->cancel_efd = -1;
+                    free (backup_handle->mem_buf);
+                    backup_handle->mem_buf = NULL;
+                    backup_handle->mem_cap = 0;
+                }
+                else
+                {
+                    backup_handle->drain_started     = true;
+                    backup_handle->buffering_enabled = true;
+                }
+            }
+        }
     }
 
     if (IS_FAILURE (pthread_mutex_unlock (&backup_handle->backup_mutex)))
@@ -1033,6 +1384,28 @@ int end_backup (BACKUP_HANDLE* backup_handle)
         goto error;
     }
 
+    /* Signal the drain/reader BEFORE taking backup_mutex: a reader parked in
+     * pop_backup_data() holds backup_mutex across its cond_wait, so waking it
+     * via buf_lock first is what lets the lock below be acquired (no deadlock). */
+    if (backup_handle->buffering_enabled)
+    {
+        pthread_mutex_lock (&backup_handle->buf_lock);
+        backup_handle->stop = true;
+        if (!backup_handle->producer_eof)
+        {
+            backup_handle->buf_error = true;   /* premature end = truncated backup */
+        }
+        pthread_cond_broadcast (&backup_handle->not_empty);
+        pthread_cond_broadcast (&backup_handle->not_full);
+        pthread_mutex_unlock (&backup_handle->buf_lock);
+
+        if (backup_handle->cancel_efd != -1)
+        {
+            uint64_t one = 1;
+            (void) write (backup_handle->cancel_efd, &one, sizeof (one));
+        }
+    }
+
     if (IS_FAILURE (pthread_mutex_lock (&backup_handle->backup_mutex)))
     {
         PRINT_LOG_ERR (ERR_INFO);
@@ -1050,6 +1423,14 @@ int end_backup (BACKUP_HANDLE* backup_handle)
             PRINT_LOG_ERR (ERR_INFO);
             goto error;
         }
+    }
+
+    /* Join the drain BEFORE close_fifo() (the drain reads fifo_fd). It was
+     * already signalled to stop above, so this returns promptly. */
+    if (backup_handle->drain_started)
+    {
+        pthread_join (backup_handle->drain_thread, NULL);
+        backup_handle->drain_started = false;
     }
 
     if (IS_FAILURE (close_fifo (BACKUP_HANDLE_TYPE, backup_handle)))
@@ -1148,6 +1529,13 @@ int read_data (BACKUP_HANDLE* backup_handle, char* buffer, unsigned int buffer_s
     int total_read_len = 0;
     int read_count = 0;
     int i;
+
+    /* buffering active: pop from the tiered buffer instead of the FIFO directly.
+     * When disabled (conf =0, or begin-time degrade) the legacy path below runs. */
+    if (backup_handle->buffering_enabled)
+    {
+        return pop_backup_data (backup_handle, buffer, buffer_size, data_len, is_backup_end);
+    }
 
     if (backup_handle->fifo_fd == -1)
     {
