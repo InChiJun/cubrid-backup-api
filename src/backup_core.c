@@ -995,6 +995,152 @@ size_t mem_ring_pop (BACKUP_HANDLE* h, char* out, size_t cap)
     return n;
 }
 
+/* ── disk tier (Phase 2): fixed-size circular spool file ── */
+
+static
+long long disk_ring_free (BACKUP_HANDLE* h)
+{
+    return h->disk_cap - h->disk_len;
+}
+
+/* Copy oldest-first out of the disk ring into out[0..cap). Caller holds buf_lock.
+ * Returns bytes read, or -1 on I/O error. */
+static
+ssize_t disk_ring_pop (BACKUP_HANDLE* h, char* out, size_t cap)
+{
+    size_t n, first, off;
+
+    n = (cap < (size_t) h->disk_len) ? cap : (size_t) h->disk_len;
+
+    if (n == 0)
+    {
+        return 0;
+    }
+
+    first = (size_t) (h->disk_cap - h->disk_head);   /* contiguous run to file end */
+    if (first > n)
+    {
+        first = n;
+    }
+
+    off = 0;
+    while (off < first)                              /* [head .. end) */
+    {
+        ssize_t k = pread (h->disk_fd, out + off, first - off, (off_t) (h->disk_head + off));
+        if (k < 0) { if (errno == EINTR) continue; return -1; }
+        if (k == 0) { return -1; }
+        off += (size_t) k;
+    }
+
+    off = 0;
+    while (off < n - first)                          /* wrap: [0 .. n-first) */
+    {
+        ssize_t k = pread (h->disk_fd, out + first + off, (n - first) - off, (off_t) off);
+        if (k < 0) { if (errno == EINTR) continue; return -1; }
+        if (k == 0) { return -1; }
+        off += (size_t) k;
+    }
+
+    h->disk_head = (h->disk_head + (long long) n) % h->disk_cap;
+    h->disk_len -= (long long) n;
+
+    return (ssize_t) n;
+}
+
+/* Reserve physical space for the spool so runtime pwrite never hits ENOSPC.
+ * Returns 0 on success, -1 if space cannot be reserved (caller degrades). */
+static
+int reserve_spool_space (int fd, long long size)
+{
+    if (fallocate (fd, 0, 0, (off_t) size) == 0)
+    {
+        return 0;
+    }
+
+    if (errno == EOPNOTSUPP || errno == ENOSYS)
+    {
+        /* filesystem (e.g. tmpfs) lacks fallocate: force allocation via zero-fill */
+        char   z[65536];
+        long long off = 0;
+
+        memset (z, 0, sizeof (z));
+
+        while (off < size)
+        {
+            size_t chunk = (size - off < (long long) sizeof (z)) ? (size_t) (size - off) : sizeof (z);
+            size_t w = 0;
+
+            while (w < chunk)
+            {
+                ssize_t k = pwrite (fd, z + w, chunk - w, (off_t) (off + (long long) w));
+                if (k < 0) { if (errno == EINTR) continue; return -1; }
+                w += (size_t) k;
+            }
+
+            off += (long long) chunk;
+        }
+
+        return 0;
+    }
+
+    return -1;   /* ENOSPC / EIO / other */
+}
+
+/* Create the per-(db,level,pid) spool file, unlink-on-open by default, and
+ * reserve its space. On success sets h->disk_fd and h->disk_cap. */
+static
+int create_spool_file (BACKUP_HANDLE* h)
+{
+    BACKUP_OPTION* opt = &backup_mgr->default_backup_option;
+
+    char path[PATH_MAX];
+    int  fd;
+    int  flags = O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC;
+
+    snprintf (path, PATH_MAX, "%s/cubrid_bkbuf_%s_L%d_%d.spool",
+              opt->buffer_disk_path, h->db_name, (int) h->backup_level, (int) getpid ());
+
+    if (IS_FAILURE (check_path_length_limit (path)))
+    {
+        PRINT_LOG_WARN ("spool path too long\n");
+        goto error;
+    }
+
+    fd = open (path, flags, 0600);
+
+    if (fd == -1 && errno == EEXIST)   /* stale file from a prior same-pid crash */
+    {
+        unlink (path);
+        fd = open (path, flags, 0600);
+    }
+
+    if (fd == -1)
+    {
+        PRINT_LOG_WARN ("spool open failed\n");
+        goto error;
+    }
+
+    if (opt->buffer_disk_keep_spool != true)
+    {
+        unlink (path);   /* space reclaimed on close / process exit (incl. crash) */
+    }
+
+    if (reserve_spool_space (fd, opt->buffer_disk_limit) != 0)
+    {
+        close (fd);
+        goto error;
+    }
+
+    h->disk_fd  = fd;
+    h->disk_cap = opt->buffer_disk_limit;
+
+    return SUCCESS;
+
+error:
+
+    return FAILURE;
+}
+
 /* Mark the buffer path failed and wake both waiters. Caller must NOT hold buf_lock. */
 static
 void buf_mark_error (BACKUP_HANDLE* h)
@@ -1079,6 +1225,8 @@ void* drain_backup_fifo (void* arg)
 
     sigset_t block_set;
     struct pollfd fds[2];
+    char* tmp = NULL;
+    size_t io_size;
 
     /* Keep SIGCHLD steered to backup_thread's sigtimedwait(); if delivered here
      * the child would never be reaped and EOF never detected. */
@@ -1086,11 +1234,25 @@ void* drain_backup_fifo (void* arg)
     sigaddset (&block_set, SIGCHLD);
     pthread_sigmask (SIG_BLOCK, &block_set, NULL);
 
+    /* disk-tier scratch: FIFO bytes are staged here before pwrite to the spool */
+    io_size = (size_t) backup_mgr->io_size;
+    if (h->disk_cap > 0)
+    {
+        tmp = malloc (io_size);
+        if (tmp == NULL)
+        {
+            buf_mark_error (h);
+            return NULL;
+        }
+    }
+
     for (;;)
     {
         char*  dst;
         size_t room, tail, contig, avail;
         ssize_t n;
+        int    use_disk;
+        long long dtail, droom;
 
         fds[0].fd = h->fifo_fd;    fds[0].events = POLLIN; fds[0].revents = 0;
         fds[1].fd = h->cancel_efd; fds[1].events = POLLIN; fds[1].revents = 0;
@@ -1112,8 +1274,25 @@ void* drain_backup_fifo (void* arg)
 
         pthread_mutex_lock (&h->buf_lock);
 
-        while (mem_ring_free (h) == 0 && !h->stop)  /* Tier-3 WAIT (backpressure) */
+        /* Choose the tier (order-preserving: once spilling, or mem full, new bytes
+         * go to disk — they are newer than all mem data) and WAIT until THAT tier
+         * has room. Waiting on "both full" would wrongly proceed when the chosen
+         * tier (disk, while spilling) is full but the other (mem) has space,
+         * yielding a 0-byte read that looks like EOF. */
+        for (;;)
         {
+            if (h->stop)
+            {
+                break;
+            }
+
+            use_disk = (h->disk_cap > 0) && (h->disk_len > 0 || mem_ring_free (h) == 0);
+
+            if (use_disk ? (disk_ring_free (h) > 0) : (mem_ring_free (h) > 0))  /* Tier-3 WAIT */
+            {
+                break;
+            }
+
             h->wait_cnt++;
             pthread_cond_wait (&h->not_full, &h->buf_lock);
         }
@@ -1124,16 +1303,34 @@ void* drain_backup_fifo (void* arg)
             break;
         }
 
-        /* reserve the contiguous free run [tail..end); drain owns it until commit */
-        tail   = (h->mem_head + h->mem_len) % h->mem_cap;
-        contig = h->mem_cap - tail;
-        avail  = h->mem_cap - h->mem_len;
-        room   = (contig < avail) ? contig : avail;
-        dst    = h->mem_buf + tail;
+        if (use_disk)
+        {
+            dtail = (h->disk_head + h->disk_len) % h->disk_cap;
+            droom = h->disk_cap - dtail;                     /* contiguous run to file end */
+            if (droom > h->disk_cap - h->disk_len)           /* bounded by total free */
+            {
+                droom = h->disk_cap - h->disk_len;
+            }
+            if (droom > (long long) io_size)                 /* one chunk at a time */
+            {
+                droom = (long long) io_size;
+            }
+            dst  = tmp;                                      /* stage in private scratch */
+            room = (size_t) droom;
+        }
+        else
+        {
+            /* reserve the contiguous free run [tail..end); drain owns it until commit */
+            tail   = (h->mem_head + h->mem_len) % h->mem_cap;
+            contig = h->mem_cap - tail;
+            avail  = h->mem_cap - h->mem_len;
+            room   = (contig < avail) ? contig : avail;
+            dst    = h->mem_buf + tail;                      /* read straight into the ring */
+        }
 
         pthread_mutex_unlock (&h->buf_lock);
 
-        n = read (h->fifo_fd, dst, room);           /* lock-free: region is drain-private */
+        n = read (h->fifo_fd, dst, room);           /* lock-free: target is drain-private */
 
         if (n < 0)
         {
@@ -1173,16 +1370,51 @@ void* drain_backup_fifo (void* arg)
             continue;
         }
 
-        pthread_mutex_lock (&h->buf_lock);
-        h->mem_len += (size_t) n;
-        h->bytes_total += n;
-        if (h->mem_len > h->hw_mem)
+        if (use_disk)
         {
-            h->hw_mem = h->mem_len;
+            ssize_t w = 0;
+
+            /* single region (room <= contiguous-to-end); loop only on partial write.
+             * space is pre-reserved at setup, so pwrite does not hit ENOSPC here. */
+            while (w < n)
+            {
+                ssize_t k = pwrite (h->disk_fd, tmp + w, (size_t) (n - w), (off_t) (dtail + w));
+                if (k < 0) { if (errno == EINTR) continue; break; }
+                w += k;
+            }
+
+            if (w != n)
+            {
+                buf_mark_error (h);
+                break;
+            }
+
+            pthread_mutex_lock (&h->buf_lock);
+            h->disk_len += n;
+            h->bytes_total += n;
+            h->spilled = true;
+            if (h->disk_len > h->hw_disk)
+            {
+                h->hw_disk = h->disk_len;
+            }
+            pthread_cond_signal (&h->not_empty);
+            pthread_mutex_unlock (&h->buf_lock);
         }
-        pthread_cond_signal (&h->not_empty);
-        pthread_mutex_unlock (&h->buf_lock);
+        else
+        {
+            pthread_mutex_lock (&h->buf_lock);
+            h->mem_len += (size_t) n;
+            h->bytes_total += n;
+            if (h->mem_len > h->hw_mem)
+            {
+                h->hw_mem = h->mem_len;
+            }
+            pthread_cond_signal (&h->not_empty);
+            pthread_mutex_unlock (&h->buf_lock);
+        }
     }
+
+    free (tmp);
 
     /* final wake so a parked reader observes producer_eof/buf_error/stop */
     pthread_mutex_lock (&h->buf_lock);
@@ -1223,9 +1455,21 @@ int pop_backup_data (BACKUP_HANDLE* h, char* buffer, unsigned int buffer_size,
         return SUCCESS;
     }
 
-    copied = mem_ring_pop (h, buffer, buffer_size);
-    /* Phase 2 (disk tier): if (copied < buffer_size && h->disk_len > 0)
-     *     copied += disk_ring_pop (h, buffer + copied, buffer_size - copied); */
+    copied = mem_ring_pop (h, buffer, buffer_size);   /* older data first */
+
+    if (copied < buffer_size && h->disk_len > 0)      /* then newer disk data */
+    {
+        ssize_t d = disk_ring_pop (h, buffer + copied, buffer_size - copied);
+
+        if (d < 0)
+        {
+            pthread_mutex_unlock (&h->buf_lock);
+            PRINT_LOG_ERR (ERR_INFO);
+            return FAILURE;
+        }
+
+        copied += (size_t) d;
+    }
 
     *data_len = (unsigned int) copied;
 
@@ -1306,6 +1550,19 @@ int begin_backup (CUBRID_BACKUP_INFO* backup_info, void** handle)
             {
                 sigset_t block_set, old_set;
                 int rc;
+
+                /* optional disk tier: create + reserve the spool BEFORE the drain
+                 * starts (the drain writes disk_fd). Failure degrades to memory-only
+                 * — it never fails begin. */
+                if (backup_mgr->default_backup_option.buffer_disk_limit > 0)
+                {
+                    if (IS_FAILURE (create_spool_file (backup_handle)))
+                    {
+                        PRINT_LOG_WARN ("spool setup failed; disk tier disabled (memory-only)\n");
+                        backup_handle->disk_fd  = -1;
+                        backup_handle->disk_cap = 0;
+                    }
+                }
 
                 /* start the drain with SIGCHLD blocked so it never steals the
                  * child-exit signal from backup_thread's sigtimedwait(). */
