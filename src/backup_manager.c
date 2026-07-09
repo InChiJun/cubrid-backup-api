@@ -6,9 +6,14 @@
 #include <errno.h>
 #include <assert.h>
 #include <pthread.h>
+#include <sys/statvfs.h>
 #include "backup_manager.h"
 
 #define INT_MAX 2147483647
+
+#ifndef LLONG_MAX
+#define LLONG_MAX 9223372036854775807LL
+#endif
 
 #define LOG_HEADER_MAX_SIZE  (50)
 #define LOG_MESSAGE_MAX_SIZE (LOG_HEADER_MAX_SIZE + 1024)
@@ -371,7 +376,13 @@ int init_default_backup_option (void)
     backup_opt->compress           = false; /* [M] */
     backup_opt->except_active_log  = false; /* [M] */
     backup_opt->sleep_msecs        = 0;     /* [M] */
- 
+
+    backup_opt->fifo_size              = 64 * 1024;          /* 64KB               */
+    backup_opt->buffer_memory_size     = 64LL * 1024 * 1024; /* 64MB, buffering ON */
+    backup_opt->buffer_disk_limit      = 0;                  /* disk tier off      */
+    backup_opt->buffer_disk_path[0]    = '\0';
+    backup_opt->buffer_disk_keep_spool = false;
+
     return SUCCESS;
 }
 
@@ -459,9 +470,81 @@ error:
 }
 
 static
+int set_size_value (long long* dest, char* src)
+{
+    char* endp;
+    long long val, factor = 1;
+
+    errno = 0;
+    val = strtoll (src, &endp, 10);
+
+    if (errno == ERANGE || val < 0)
+    {
+        PRINT_LOG_ERR (ERR_INFO);
+        goto error;
+    }
+
+    /* optional binary (1024-based) size suffix */
+    if (*endp != '\0')
+    {
+        if (IS_ZERO (strncasecmp (endp, "KB", 3)))
+        {
+            factor = 1024LL;
+        }
+        else if (IS_ZERO (strncasecmp (endp, "MB", 3)))
+        {
+            factor = 1024LL * 1024;
+        }
+        else if (IS_ZERO (strncasecmp (endp, "GB", 3)))
+        {
+            factor = 1024LL * 1024 * 1024;
+        }
+        else
+        {
+            PRINT_LOG_ERR (ERR_INFO);
+            goto error;
+        }
+    }
+
+    if (val > LLONG_MAX / factor)   /* suffix-multiply overflow guard */
+    {
+        PRINT_LOG_ERR (ERR_INFO);
+        goto error;
+    }
+
+    *dest = val * factor;
+
+    return SUCCESS;
+
+error:
+
+    return FAILURE;
+}
+
+static
+int set_path_value (char* dest, size_t dest_size, char* src)
+{
+    if (strlen (src) >= dest_size)
+    {
+        PRINT_LOG_ERR (ERR_INFO);
+        goto error;
+    }
+
+    snprintf (dest, dest_size, "%s", src);
+
+    return SUCCESS;
+
+error:
+
+    return FAILURE;
+}
+
+static
 int set_backup_option (char* key, char* value)
 {
     BACKUP_OPTION* backup_opt;
+
+    long long sz;
 
     backup_opt = &backup_mgr->default_backup_option;
 
@@ -521,6 +604,48 @@ int set_backup_option (char* key, char* value)
             goto error;
         }
     }
+    else if (IS_ZERO (strncasecmp (key, "fifo_size", 10)))
+    {
+        if (IS_FAILURE (set_size_value (&sz, value)) || sz > INT_MAX)
+        {
+            PRINT_LOG_ERR (ERR_INFO);
+            goto error;
+        }
+
+        backup_opt->fifo_size = (int) sz;
+    }
+    else if (IS_ZERO (strncasecmp (key, "buffer_memory_size", 19)))
+    {
+        if (IS_FAILURE (set_size_value (&backup_opt->buffer_memory_size, value)))
+        {
+            PRINT_LOG_ERR (ERR_INFO);
+            goto error;
+        }
+    }
+    else if (IS_ZERO (strncasecmp (key, "buffer_disk_limit", 18)))
+    {
+        if (IS_FAILURE (set_size_value (&backup_opt->buffer_disk_limit, value)))
+        {
+            PRINT_LOG_ERR (ERR_INFO);
+            goto error;
+        }
+    }
+    else if (IS_ZERO (strncasecmp (key, "buffer_disk_path", 17)))
+    {
+        if (IS_FAILURE (set_path_value (backup_opt->buffer_disk_path, PATH_MAX, value)))
+        {
+            PRINT_LOG_ERR (ERR_INFO);
+            goto error;
+        }
+    }
+    else if (IS_ZERO (strncasecmp (key, "buffer_disk_keep_spool", 23)))
+    {
+        if (IS_FAILURE (set_bool_value (&backup_opt->buffer_disk_keep_spool, value)))
+        {
+            PRINT_LOG_ERR (ERR_INFO);
+            goto error;
+        }
+    }
     else
     {
         PRINT_LOG_ERR (ERR_INFO);
@@ -574,7 +699,7 @@ static
 int compile_regex (regex_t* re_opt_header, regex_t* re_opt, regex_t* re_empty_line)
 {
     char* regex_header     = "^[[:blank:]]*\\[[[:blank:]]*(backup|restore)[[:blank:]]*\\][[:space:]]*$";
-    char* regex_key_value  = "^[[:blank:]]*([_[:alpha:]]+)[[:blank:]]*=[[:blank:]]*([[:alnum:]]+)[[:space:]]*$";
+    char* regex_key_value  = "^[[:blank:]]*([_[:alpha:]]+)[[:blank:]]*=[[:blank:]]*([[:alnum:]/._-]+)[[:space:]]*$";
     char* regex_empty_line = "^[[:space:]]*$";
 
     if (IS_FAILURE (regcomp (re_opt_header, regex_header, REG_ICASE | REG_EXTENDED)))
@@ -793,6 +918,70 @@ error:
     return FAILURE;
 }
 
+static
+int validate_backup_option (void)
+{
+    BACKUP_OPTION* backup_opt;
+
+    backup_opt = &backup_mgr->default_backup_option;
+
+    /* fifo_size: clamp to [64KB, 1MB] (Linux default pipe-max-size). Non-fatal. */
+    if (backup_opt->fifo_size < 64 * 1024)
+    {
+        PRINT_LOG_WARN ("fifo_size below 64KB; raising to 64KB\n");
+        backup_opt->fifo_size = 64 * 1024;
+    }
+
+    if (backup_opt->fifo_size > 1024 * 1024)
+    {
+        PRINT_LOG_WARN ("fifo_size above 1MB; clamping to 1MB\n");
+        backup_opt->fifo_size = 1024 * 1024;
+    }
+
+    /* memory tier must hold at least one io_size chunk when enabled */
+    if (backup_opt->buffer_memory_size != 0 &&
+        backup_opt->buffer_memory_size < backup_mgr->io_size)
+    {
+        PRINT_LOG_ERR (ERR_INFO);
+        goto error;
+    }
+
+    /* disk tier is an overflow of the memory tier and needs a valid spool dir */
+    if (backup_opt->buffer_disk_limit > 0)
+    {
+        struct statvfs vfs;
+
+        if (backup_opt->buffer_memory_size == 0)
+        {
+            PRINT_LOG_ERR (ERR_INFO);
+            goto error;
+        }
+
+        if (IS_FAILURE (validate_dir (backup_opt->buffer_disk_path)))
+        {
+            PRINT_LOG_ERR (ERR_INFO);
+            goto error;
+        }
+
+        /* free-space shortfall is a warning, not a failure (runtime ENOSPC degrades) */
+        if (statvfs (backup_opt->buffer_disk_path, &vfs) == 0)
+        {
+            long long avail = (long long) vfs.f_bavail * (long long) vfs.f_frsize;
+
+            if (avail < backup_opt->buffer_disk_limit)
+            {
+                PRINT_LOG_WARN ("spool free space is below buffer_disk_limit\n");
+            }
+        }
+    }
+
+    return SUCCESS;
+
+error:
+
+    return FAILURE;
+}
+
 int start_backup_manager (void)
 {
     if (IS_FAILURE (open_log_file ()))
@@ -820,6 +1009,12 @@ int start_backup_manager (void)
     }
 
     if (IS_FAILURE (set_io_size ()))
+    {
+        PRINT_LOG_ERR (ERR_INFO);
+        goto error;
+    }
+
+    if (IS_FAILURE (validate_backup_option ()))
     {
         PRINT_LOG_ERR (ERR_INFO);
         goto error;

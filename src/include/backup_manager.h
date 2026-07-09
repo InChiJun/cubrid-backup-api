@@ -28,6 +28,12 @@ struct backup_option
     bool compress;
     bool except_active_log;
     int sleep_msecs;
+
+    int       fifo_size;              /* bytes, default 64KB, clamped <= 1MB */
+    long long buffer_memory_size;     /* bytes, 0 = buffering disabled       */
+    long long buffer_disk_limit;      /* bytes, 0 = no disk tier             */
+    char      buffer_disk_path[PATH_MAX];
+    bool      buffer_disk_keep_spool; /* default false = unlink-on-open      */
 };
 
 typedef struct restore_option RESTORE_OPTION;
