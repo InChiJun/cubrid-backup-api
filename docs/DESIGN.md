@@ -3,7 +3,7 @@
 - 대상: `cubrid-backup-api` (backupdb pipe backup 연동 API)
 - 브랜치: `feature/tiered-buffer`
 - 분류: 단기 처방(short-term mitigation), Linux/POSIX 전용
-- 상태: 구현 착수용 확정 설계. 멀티에이전트 검증(64 포인트) + 코드/빌드/서버 사실검증(prep A~F) 반영.
+- 상태: **구현 완료(M-1~M-6) + 실환경 검증 완료.** 멀티에이전트 검증(64 포인트) + 코드/빌드/서버 사실검증(prep A~F) 반영. 실제 CUBRID backupdb/restoredb 테스트 결과는 [TEST_RESULTS.md](TEST_RESULTS.md) 참조 — 느린 소비자에서 LOG_CS 점유가 downstream 속도와 분리됨(최대 15×+ 단축)을 실증.
 
 > 근거 문서: 원본 설계 초안(`tiered_buffer_design.md`), 검증 결과(`tiered_buffer_apply_points_verified.md`), prep 레퍼런스 `~/tbuf_prep/A~F`.
 
