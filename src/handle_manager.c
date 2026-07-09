@@ -1,4 +1,7 @@
 #include <errno.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <stdint.h>
 #include "handle_manager.h"
 
 HANDLE_MANAGER handle_manager;
@@ -20,6 +23,35 @@ int initialize_handle_manager (void)
         goto error;
     }
 
+    /* tiered-buffer sync objects: init once per process (the handle is reused
+     * across begin/end, so these must NOT be re-init'd per backup). */
+    if (IS_FAILURE (pthread_mutex_init (&handle_mgr->backup_handle.buf_lock, NULL)))
+    {
+        PRINT_LOG_ERR (ERR_INFO);
+        goto error;
+    }
+
+    if (IS_FAILURE (pthread_cond_init (&handle_mgr->backup_handle.not_empty, NULL)))
+    {
+        PRINT_LOG_ERR (ERR_INFO);
+        goto error;
+    }
+
+    if (IS_FAILURE (pthread_cond_init (&handle_mgr->backup_handle.not_full, NULL)))
+    {
+        PRINT_LOG_ERR (ERR_INFO);
+        goto error;
+    }
+
+    /* Seed fd sentinels to -1 up front: the static handle is zero-initialized,
+     * so without this a finalize before the first begin would close() fd 0. */
+    handle_mgr->backup_handle.fifo_fd       = -1;
+    handle_mgr->backup_handle.disk_fd       = -1;
+    handle_mgr->backup_handle.cancel_efd    = -1;
+    handle_mgr->backup_handle.mem_buf       = NULL;
+    handle_mgr->backup_handle.drain_started = false;
+    handle_mgr->restore_handle.restore_fd   = -1;
+
     return SUCCESS;
 
 error:
@@ -33,6 +65,10 @@ int finalize_handle_manager (void)
     pthread_mutex_destroy (&handle_mgr->backup_handle.backup_mutex);
 
     pthread_mutex_destroy (&handle_mgr->restore_handle.restore_mutex);
+
+    pthread_cond_destroy (&handle_mgr->backup_handle.not_full);
+    pthread_cond_destroy (&handle_mgr->backup_handle.not_empty);
+    pthread_mutex_destroy (&handle_mgr->backup_handle.buf_lock);
 
     return SUCCESS;
 }
@@ -54,6 +90,34 @@ int initialize_backup_handle (BACKUP_HANDLE* backup_handle)
     backup_handle->fifo_path[0] = '\0';
 
     backup_handle->db_name[0] = '\0';
+
+    /* ── tiered buffer: reset only (handle is reused; never malloc/open here) ── */
+    backup_handle->buffering_enabled = false;
+    backup_handle->drain_started     = false;
+    backup_handle->stop              = false;
+    backup_handle->cancel_efd        = -1;
+
+    backup_handle->mem_buf  = NULL;
+    backup_handle->mem_cap  = 0;
+    backup_handle->mem_len  = 0;
+    backup_handle->mem_head = 0;
+    backup_handle->mem_tail = 0;
+
+    backup_handle->disk_fd   = -1;
+    backup_handle->disk_cap  = 0;
+    backup_handle->disk_len  = 0;
+    backup_handle->disk_head = 0;
+    backup_handle->disk_tail = 0;
+
+    backup_handle->producer_eof = false;
+    backup_handle->buf_error    = false;
+
+    backup_handle->hw_mem        = 0;
+    backup_handle->hw_disk       = 0;
+    backup_handle->spilled       = false;
+    backup_handle->wait_cnt      = 0;
+    backup_handle->wait_us_total = 0;
+    backup_handle->bytes_total   = 0;
 
     return SUCCESS;
 }
@@ -79,10 +143,49 @@ int finalize_backup_handle (BACKUP_HANDLE* backup_handle)
         pthread_join (backup_handle->backup_thread, NULL);
     }
 
+    /* tiered-buffer: wake a parked drain (cond_wait / poll) and join it BEFORE
+     * the fifo is closed (the drain reads fifo_fd). No-op until a drain is
+     * spawned (drain_started stays false in M-1..M-3). */
+    if (backup_handle->drain_started)
+    {
+        pthread_mutex_lock (&backup_handle->buf_lock);
+        backup_handle->stop      = true;
+        backup_handle->buf_error = true;
+        pthread_cond_broadcast (&backup_handle->not_empty);
+        pthread_cond_broadcast (&backup_handle->not_full);
+        pthread_mutex_unlock (&backup_handle->buf_lock);
+
+        if (backup_handle->cancel_efd != -1)
+        {
+            uint64_t one = 1;
+            (void) write (backup_handle->cancel_efd, &one, sizeof (one));
+        }
+
+        pthread_join (backup_handle->drain_thread, NULL);
+        backup_handle->drain_started = false;
+    }
+
     if (backup_handle->fifo_fd != -1)
     {
         close (backup_handle->fifo_fd);
         unlink (backup_handle->fifo_path);
+    }
+
+    /* spool fd close reclaims disk space (unlink-on-open); free the mem ring.
+     * initialize_backup_handle() below resets these, keeping teardown idempotent. */
+    if (backup_handle->disk_fd != -1)
+    {
+        close (backup_handle->disk_fd);
+    }
+
+    if (backup_handle->cancel_efd != -1)
+    {
+        close (backup_handle->cancel_efd);
+    }
+
+    if (backup_handle->mem_buf != NULL)
+    {
+        free (backup_handle->mem_buf);
     }
 
     initialize_backup_handle (backup_handle);

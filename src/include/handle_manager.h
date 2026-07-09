@@ -52,6 +52,40 @@ struct backup_handle
     char fifo_path[PATH_MAX];
 
     char db_name[MAX_DB_NAME_LEN + 1];
+
+    /* ── tiered buffer (feature/tiered-buffer) ── */
+    bool buffering_enabled;   /* mem_buf alloc 성공 시 true; false=구 direct-FIFO 경로 */
+    bool drain_started;       /* drain_thread join 가드 (THREAD_STATE는 backup_thread 전용) */
+    bool stop;                /* 통합 종료 신호 (cancel/error/eof) */
+    int  cancel_efd;          /* eventfd: poll 중 drain 즉시 기상; -1 = 미사용 */
+
+    char*  mem_buf;           /* malloc(mem_cap), 메모리 링; NULL = 미할당 */
+    size_t mem_cap;
+    size_t mem_len;
+    size_t mem_head;
+    size_t mem_tail;
+
+    int       disk_fd;        /* spool 파일 (Phase 2); -1 = 미사용 */
+    long long disk_cap;
+    long long disk_len;
+    long long disk_head;
+    long long disk_tail;
+
+    bool producer_eof;        /* drain: FIFO 정상 EOF 도달 */
+    bool buf_error;           /* 완충 경로 에러/취소 */
+
+    pthread_t       drain_thread;
+    pthread_mutex_t buf_lock;
+    pthread_cond_t  not_empty;
+    pthread_cond_t  not_full;
+
+    /* observability */
+    size_t        hw_mem;
+    long long     hw_disk;
+    bool          spilled;
+    unsigned long wait_cnt;
+    long long     wait_us_total;
+    long long     bytes_total;
 };
 
 typedef struct restore_handle RESTORE_HANDLE;
