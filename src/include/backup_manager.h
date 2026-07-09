@@ -15,6 +15,8 @@
     print_log ("INFO:", __VA_ARGS__)
 #define PRINT_LOG_ERR(...) \
     print_log ("ERROR:", __VA_ARGS__)
+#define PRINT_LOG_WARN(...) \
+    print_log ("WARNING:", __VA_ARGS__)
 
 typedef struct backup_option BACKUP_OPTION;
 struct backup_option

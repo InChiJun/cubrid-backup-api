@@ -28,6 +28,12 @@ endif()
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
+# tiered buffer: drain thread (pthread) + Linux/glibc syscalls
+# (F_SETPIPE_SZ, fallocate, eventfd) require _GNU_SOURCE.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+add_compile_definitions(_GNU_SOURCE)
+
 set(CUBRID_BACKUP_API_SRCS
     ${CMAKE_SOURCE_DIR}/backup_api.c
     ${CMAKE_SOURCE_DIR}/backup_core.c
@@ -39,6 +45,10 @@ set_target_properties(${PROJECT_NAME}
                       PROPERTIES
                           SOVERSION "${CUBRID_BACKUP_API_MAJOR_VER}.${CUBRID_BACKUP_API_MINOR_VER}"
                           PUBLIC_HEADER "${CMAKE_SOURCE_DIR}/include/backup_api.h")
+
+# The library itself now spawns the drain thread, so link pthread explicitly
+# instead of relying on the loading executable to pull it in.
+target_link_libraries(${PROJECT_NAME} PRIVATE Threads::Threads)
 
 install(TARGETS ${PROJECT_NAME}
         LIBRARY

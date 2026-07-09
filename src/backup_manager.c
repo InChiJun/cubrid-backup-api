@@ -5,6 +5,7 @@
 #include <sys/timeb.h>
 #include <errno.h>
 #include <assert.h>
+#include <pthread.h>
 #include "backup_manager.h"
 
 #define INT_MAX 2147483647
@@ -15,6 +16,10 @@
 BACKUP_MANAGER backup_manager;
 
 BACKUP_MANAGER* backup_mgr = &backup_manager;
+
+/* print_log() serializes on this leaf lock: once the drain thread also logs,
+ * the static log_buffer and the append to log_fp are shared state. */
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static
 int make_log_header (char* buf, size_t buf_len, const char *prefix_str)
@@ -62,6 +67,8 @@ int print_log (const char *prefix_str, const char *msg, ...)
         return SUCCESS;
     }
 
+    pthread_mutex_lock (&log_mutex);
+
     p = log_buffer;
     len = LOG_MESSAGE_MAX_SIZE;
     n = make_log_header (p, len, prefix_str);
@@ -79,8 +86,12 @@ int print_log (const char *prefix_str, const char *msg, ...)
         va_end (arg_list);
     }
 
-    fprintf (backup_mgr->log_fp, log_buffer);
+    /* "%s": log_buffer is data, not a format string — conf-supplied values
+     * (e.g. buffer_disk_path) may contain '%'. */
+    fprintf (backup_mgr->log_fp, "%s", log_buffer);
     fflush (backup_mgr->log_fp);
+
+    pthread_mutex_unlock (&log_mutex);
 
     return SUCCESS;
 }
