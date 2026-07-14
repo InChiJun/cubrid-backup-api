@@ -9,6 +9,7 @@
 #include "backup_core.h"
 #include "backup_manager.h"
 #include "handle_manager.h"
+#include "cubrid_backup_format.h"
 
 pthread_once_t backup_api_once_initialize = PTHREAD_ONCE_INIT;
 pthread_once_t backup_api_once_finalize   = PTHREAD_ONCE_INIT;
@@ -995,6 +996,43 @@ size_t mem_ring_pop (BACKUP_HANDLE* h, char* out, size_t cap)
     return n;
 }
 
+/* Append into the memory ring tail (mirror of mem_ring_pop). Caller holds
+ * buf_lock. Writes min(len, free) bytes, wrap-aware, and returns that count.
+ * Used only to place a held data-phase probe chunk (§4.4). */
+static
+size_t mem_ring_put (BACKUP_HANDLE* h, const char* in, size_t len)
+{
+    size_t n, tail, first;
+
+    n = h->mem_cap - h->mem_len;        /* free */
+    if (n > len)
+    {
+        n = len;
+    }
+    if (n == 0)
+    {
+        return 0;
+    }
+
+    tail  = (h->mem_head + h->mem_len) % h->mem_cap;
+    first = h->mem_cap - tail;          /* contiguous run to end */
+    if (first > n)
+    {
+        first = n;
+    }
+
+    memcpy (h->mem_buf + tail, in, first);
+
+    if (n > first)                      /* wrap to buffer start */
+    {
+        memcpy (h->mem_buf, in + first, n - first);
+    }
+
+    h->mem_len += n;
+
+    return n;
+}
+
 /* ── disk tier (Phase 2): fixed-size circular spool file ── */
 
 static
@@ -1216,6 +1254,232 @@ void drain_classify_eof (BACKUP_HANDLE* h)
     pthread_mutex_unlock (&h->buf_lock);
 }
 
+/* ── observational log-phase parser (DRAIN THREAD ONLY) ───────────────────────
+ * Peeks the backup byte-stream framing to detect entry into the log-copy phase
+ * (the section the server writes while holding LOG_CS). It NEVER alters, drops,
+ * reorders, or gates which bytes get committed — its ONLY output is h->log_phase,
+ * which selects the tiered buffer's use_disk policy. Any parse anomaly disables
+ * it → single-mode fallback (worst case == pre-feature behaviour; a desync can
+ * never corrupt the byte stream). See log_cs_parser_design.md. */
+
+static
+void parser_disable (BACKUP_HANDLE* h, const char* why)
+{
+    if (h->parser.st == PS_DISABLED)
+    {
+        return;
+    }
+
+    h->parser.st = PS_DISABLED;
+
+    if (h->parser.gh != NULL)
+    {
+        free (h->parser.gh);
+        h->parser.gh = NULL;
+    }
+
+    /* parser_on drives the (drain-local) tier decision; mirror under buf_lock so
+     * a concurrent reader/logger observes a consistent value. */
+    pthread_mutex_lock (&h->buf_lock);
+    h->parser_on = false;
+    pthread_mutex_unlock (&h->buf_lock);
+
+    PRINT_LOG_WARN ("log-phase parser disabled (%s); tiered buffer degraded to single-mode\n", why);
+}
+
+/* Arm the reserved spool: drain-local write to log_phase, mirrored to phase_pub
+ * under buf_lock for observability. */
+static
+void enter_log_phase (BACKUP_HANDLE* h)
+{
+    h->log_phase = true;
+
+    pthread_mutex_lock (&h->buf_lock);
+    h->phase_pub = true;
+    pthread_mutex_unlock (&h->buf_lock);
+
+    PRINT_LOG_INFO ("log-phase boundary detected (~%lld bytes in); reserved spool armed\n",
+                    (long long) h->bytes_total);
+}
+
+/* Gate the accumulated global header: accept ONLY {START marker, magic v2,
+ * version 2, LZ4} — the single walkable combination. */
+static
+int gate_ok (BACKUP_HANDLE* h)
+{
+    CUB_BKUP_HEADER* g = (CUB_BKUP_HEADER *) h->parser.gh;
+
+    if (g->iopageid != CUB_BK_START_PAGE_ID)
+    {
+        return 0;
+    }
+    if (memcmp (g->magic, CUB_BK_MAGIC, sizeof (CUB_BK_MAGIC) - 1) != 0)
+    {
+        return 0;
+    }
+    if (g->bk_hdr_version != CUB_BK_HDR_VERSION)
+    {
+        return 0;
+    }
+    if (g->zip_method != CUB_BK_ZIP_LZ4)   /* NONE/ZLIB framing differs → not walkable */
+    {
+        return 0;
+    }
+    if (g->bkpagesize <= 0 || g->bkpagesize > CUB_BK_MAX_BKPAGESIZE)
+    {
+        return 0;
+    }
+
+    h->parser.bkpagesize = g->bkpagesize;
+    return 1;
+}
+
+/* volid whitelist: a data volume [0, MAX] or a known system negative volid.
+ * Floor is DWB(-22) for robustness (the log/archive floor proper is -20). */
+static
+int volid_valid (int v)
+{
+    if (v >= 0 && v <= CUB_LOG_MAX_DBVOLID)
+    {
+        return 1;
+    }
+    return (v <= CUB_BK_START_PAGE_ID && v >= CUB_LOG_DWB_VOLID);   /* -2 .. -22 */
+}
+
+/* Consume the bytes just read from the FIFO, [buf, buf+n), advancing the framing
+ * walker across ANY read-chunk boundary (fields/skips persist across calls). The
+ * only bytes ever inspected are the one-time global header plus ≤18 B per file
+ * (tag + nbytes + volid); every compressed page is skipped by its self-declared
+ * length without being read or decompressed. */
+static
+void parser_observe (BACKUP_HANDLE* h, const char* buf, size_t n)
+{
+    BK_PARSER* p = &h->parser;
+    size_t i = 0;
+
+    while (i < n)
+    {
+        size_t avail = n - i;
+
+        switch (p->st)
+        {
+            case PS_DONE:            /* log phase latched: the tail is all log */
+            case PS_DISABLED:        /* fallback policy in force               */
+                return;
+
+            case PS_GATE:            /* accumulate the global header, then gate */
+            {
+                size_t take = (avail < p->need) ? avail : p->need;
+                memcpy (p->gh + p->got, buf + i, take);
+                p->got  += take;
+                p->need -= take;
+                i       += take;
+                if (p->need == 0)
+                {
+                    if (!gate_ok (h))
+                    {
+                        parser_disable (h, "gate");
+                        return;
+                    }
+                    free (p->gh);
+                    p->gh   = NULL;
+                    p->skip = (long long) CUB_BK_HEADER_IO_SIZE - (long long) CUB_BK_HEADER_STRUCT;
+                    p->st   = PS_SKIP;         /* consume header padding, then walk tags */
+                }
+                break;
+            }
+
+            case PS_SKIP:            /* discard payload / unit-tail / header pad */
+            {
+                size_t take = (avail < (size_t) p->skip) ? avail : (size_t) p->skip;
+                p->skip -= (long long) take;
+                i       += take;
+                if (p->skip == 0)
+                {
+                    p->st   = PS_TAG;
+                    p->got  = 0;
+                    p->need = CUB_BK_TAG_SIZE;
+                }
+                break;
+            }
+
+            case PS_TAG:             /* peek the 4-byte frame lead */
+            {
+                int32_t tag;
+                size_t take = (avail < p->need) ? avail : p->need;
+                memcpy (p->acc + p->got, buf + i, take);
+                p->got  += take;
+                p->need -= take;
+                i       += take;
+                if (p->need != 0)
+                {
+                    break;           /* tag straddles reads; resume next call */
+                }
+                memcpy (&tag, p->acc, CUB_BK_TAG_SIZE);   /* native int; same-host pipe */
+                if (tag >= 0)                             /* compressed page: [buf_len][payload] */
+                {
+                    if (tag == 0 || tag > p->bkpagesize + CUB_BK_PAGE_OVERHEAD)
+                    {
+                        parser_disable (h, "buf_len");
+                        return;
+                    }
+                    p->skip = tag;
+                    p->st   = PS_SKIP;                    /* skip payload without reading it */
+                }
+                else if (tag == CUB_BK_FILE_START_PAGE_ID)   /* -4: the ONLY raw negative tag */
+                {
+                    p->got  = CUB_BK_TAG_SIZE;            /* keep tag; gather through volid */
+                    p->need = CUB_BK_FS_PEEK - CUB_BK_TAG_SIZE;
+                    p->st   = PS_FS_HDR;
+                }
+                else                                      /* -2/-3/-5/-6 never appear mid-stream */
+                {
+                    parser_disable (h, "unexpected-neg-tag");
+                    return;
+                }
+                break;
+            }
+
+            case PS_FS_HDR:          /* accumulate through volid, then classify */
+            {
+                int64_t nbytes;
+                int16_t volid;
+                size_t take = (avail < p->need) ? avail : p->need;
+                memcpy (p->acc + p->got, buf + i, take);
+                p->got  += take;
+                p->need -= take;
+                i       += take;
+                if (p->need != 0)
+                {
+                    break;           /* header straddles reads; resume next call */
+                }
+                memcpy (&nbytes, p->acc + CUB_BK_WIRE_NBYTES_OFF, 8);
+                memcpy (&volid,  p->acc + CUB_BK_WIRE_VOLID_OFF,  2);
+                if (nbytes < 0 || !volid_valid (volid))
+                {
+                    parser_disable (h, "fs-hdr");
+                    return;
+                }
+                if (volid >= 0)
+                {
+                    p->saw_data_vol = 1;                  /* a data volume has streamed */
+                }
+                else if (p->saw_data_vol)
+                {
+                    enter_log_phase (h);                  /* boundary: first neg volid after data */
+                    p->st = PS_DONE;
+                    return;
+                }
+                /* pre-data negative (TDE/volinfo) or a data volume: skip the rest of
+                 * this FILE_START unit and resume tag-walking. */
+                p->skip = (long long) CUB_BK_FILE_UNIT - (long long) CUB_BK_FS_PEEK;
+                p->st   = PS_SKIP;
+                break;
+            }
+        }
+    }
+}
+
 /* Drain thread: continuously read the FIFO into the tiered buffer so the pipe
  * stays empty and backupdb never blocks/spins in the LOG_CS window. */
 static
@@ -1227,6 +1491,10 @@ void* drain_backup_fifo (void* arg)
     struct pollfd fds[2];
     char* tmp = NULL;
     size_t io_size;
+    size_t stage_cap;         /* scratch size: max(io_size, pipe capacity)       */
+    int    probe_ok;          /* data-phase boundary probe is usable this run     */
+    size_t carry_off = 0;     /* pending data-phase probe chunk held in tmp       */
+    size_t carry_len = 0;
 
     /* Keep SIGCHLD steered to backup_thread's sigtimedwait(); if delivered here
      * the child would never be reaped and EOF never detected. */
@@ -1234,16 +1502,46 @@ void* drain_backup_fifo (void* arg)
     sigaddset (&block_set, SIGCHLD);
     pthread_sigmask (SIG_BLOCK, &block_set, NULL);
 
-    /* disk-tier scratch: FIFO bytes are staged here before pwrite to the spool */
-    io_size = (size_t) backup_mgr->io_size;
+    /* disk-tier scratch. Sized to the LARGER of io_size and the kernel pipe
+     * capacity, so a single boundary "probe" read can span the whole pipe
+     * backlog and always capture the log-phase FILE_START that backupdb has
+     * committed while blocked under LOG_CS (design §4.6 / MAJOR-A). */
+    io_size   = (size_t) backup_mgr->io_size;
+    stage_cap = io_size;
+    {
+        int pcap = fcntl (h->fifo_fd, F_GETPIPE_SZ);
+        long long want = (pcap > 0)
+                         ? (long long) pcap
+                         : (long long) backup_mgr->default_backup_option.fifo_size;
+        if (want > (long long) stage_cap)
+        {
+            stage_cap = (size_t) want;
+        }
+    }
     if (h->disk_cap > 0)
     {
-        tmp = malloc (io_size);
+        tmp = malloc (stage_cap);
         if (tmp == NULL)
         {
             buf_mark_error (h);
             return NULL;
         }
+    }
+
+    /* The probe commits its (possibly pipe-sized) chunk to the reserved spool in
+     * one shot, so it is only usable when the reserve can hold it. This is a
+     * static capacity test; live parser_on is re-checked at the probe guard so a
+     * mid-run parser_disable cleanly reverts to single-mode. */
+    probe_ok = (h->disk_cap >= (long long) stage_cap);
+
+    /* If the reserve is smaller than one pipe's worth, the probe can never commit
+     * a boundary chunk — the data phase would then withhold the reserve AND never
+     * detect the boundary, which is strictly WORSE than single-mode. Revert to
+     * true single-mode fallback (spill_ok becomes true; the reserve is used as
+     * plain overflow exactly like the pre-feature path). */
+    if (h->parser_on && !probe_ok)
+    {
+        parser_disable (h, "reserve-smaller-than-pipe");
     }
 
     for (;;)
@@ -1252,7 +1550,39 @@ void* drain_backup_fifo (void* arg)
         size_t room, tail, contig, avail;
         ssize_t n;
         int    use_disk;
-        long long dtail, droom;
+        int    probe = 0;
+        long long dtail = 0, droom = 0;
+
+        /* Flush a pending data-phase probe chunk into the memory ring before any
+         * new read. These bytes are older than anything read next (order intact)
+         * and never touch the reserved disk. */
+        if (carry_len > 0)
+        {
+            size_t k;
+
+            pthread_mutex_lock (&h->buf_lock);
+            while (mem_ring_free (h) == 0 && !h->stop)
+            {
+                h->wait_cnt++;
+                pthread_cond_wait (&h->not_full, &h->buf_lock);
+            }
+            if (h->stop)
+            {
+                pthread_mutex_unlock (&h->buf_lock);
+                break;
+            }
+            k = mem_ring_put (h, tmp + carry_off, carry_len);
+            carry_off += k;
+            carry_len -= k;
+            h->bytes_total += (long long) k;
+            if (h->mem_len > h->hw_mem)
+            {
+                h->hw_mem = h->mem_len;
+            }
+            pthread_cond_signal (&h->not_empty);
+            pthread_mutex_unlock (&h->buf_lock);
+            continue;                            /* keep flushing until carry drained */
+        }
 
         fds[0].fd = h->fifo_fd;    fds[0].events = POLLIN; fds[0].revents = 0;
         fds[1].fd = h->cancel_efd; fds[1].events = POLLIN; fds[1].revents = 0;
@@ -1281,15 +1611,36 @@ void* drain_backup_fifo (void* arg)
          * yielding a 0-byte read that looks like EOF. */
         for (;;)
         {
+            int spill_ok;
+
             if (h->stop)
             {
                 break;
             }
 
-            use_disk = (h->disk_cap > 0) && (h->disk_len > 0 || mem_ring_free (h) == 0);
+            /* 2-mode reserved spool: in the DATA phase (parser on, log phase not
+             * yet reached) the disk reserve is withheld — mem-only, then WAIT
+             * (harmless backpressure; LOG_CS not held). Once the LOG phase is
+             * reached (or the parser is off = single-mode fallback) the reserve is
+             * armed exactly as the original expression did. */
+            spill_ok = (!h->parser_on) || h->log_phase;
+
+            use_disk = (h->disk_cap > 0)
+                       && (h->disk_len > 0 || (mem_ring_free (h) == 0 && spill_ok));
 
             if (use_disk ? (disk_ring_free (h) > 0) : (mem_ring_free (h) > 0))  /* Tier-3 WAIT */
             {
+                break;
+            }
+
+            /* DATA phase, mem full, reserve still empty: rather than park (which
+             * would strand the boundary FILE_START in a full pipe while backupdb
+             * blocks under LOG_CS), probe one pipe-sized chunk into the scratch to
+             * reach and classify the boundary WITHOUT waiting for the reader. */
+            if (h->parser_on && probe_ok && !h->log_phase
+                && h->disk_len == 0 && carry_len == 0)
+            {
+                probe = 1;
                 break;
             }
 
@@ -1303,7 +1654,13 @@ void* drain_backup_fifo (void* arg)
             break;
         }
 
-        if (use_disk)
+        if (probe)
+        {
+            dst  = tmp;                                      /* span the pipe backlog */
+            room = stage_cap;
+            h->lookahead_cnt++;
+        }
+        else if (use_disk)
         {
             dtail = (h->disk_head + h->disk_len) % h->disk_cap;
             droom = h->disk_cap - dtail;                     /* contiguous run to file end */
@@ -1334,6 +1691,7 @@ void* drain_backup_fifo (void* arg)
 
         if (n < 0)
         {
+            probe = 0;
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
             {
                 continue;
@@ -1347,6 +1705,8 @@ void* drain_backup_fifo (void* arg)
             /* EOF from kernel. Spurious if backupdb has not opened the write end
              * yet (state still RUNNING/NO_SPAWN) — wait briefly and retry. */
             THREAD_STATE st = h->backup_thread_state;
+
+            probe = 0;
 
             if (st == THREAD_STATE_EXIT || st == THREAD_STATE_EXIT_WITH_ERROR || h->is_cancel)
             {
@@ -1365,6 +1725,66 @@ void* drain_backup_fifo (void* arg)
             if (h->stop)
             {
                 break;
+            }
+
+            continue;
+        }
+
+        /* Peek the bytes just read (read-only; never mutated/dropped/reordered).
+         * Runs before the commit bumps mem_len, so peeking mem_buf+tail races
+         * nothing — the reader cannot see [tail..) yet. */
+        if (h->parser_on)
+        {
+            parser_observe (h, dst, (size_t) n);
+        }
+
+        if (probe)
+        {
+            probe = 0;
+
+            if (h->log_phase)
+            {
+                /* Boundary caught in this chunk. It is the FIRST disk write (probe
+                 * fires only when disk_len==0) so dtail==0 and the whole chunk
+                 * (trailing data + boundary + leading log) fits contiguously
+                 * (n <= stage_cap <= disk_cap via probe_ok). Spill it in order. */
+                ssize_t w = 0;
+
+                pthread_mutex_lock (&h->buf_lock);
+                dtail = (h->disk_head + h->disk_len) % h->disk_cap;   /* == 0 */
+                pthread_mutex_unlock (&h->buf_lock);
+
+                while (w < n)
+                {
+                    ssize_t k = pwrite (h->disk_fd, tmp + w, (size_t) (n - w), (off_t) (dtail + w));
+                    if (k < 0) { if (errno == EINTR) continue; break; }
+                    w += k;
+                }
+
+                if (w != n)
+                {
+                    buf_mark_error (h);
+                    break;
+                }
+
+                pthread_mutex_lock (&h->buf_lock);
+                h->disk_len += n;
+                h->bytes_total += n;
+                h->spilled = true;
+                if (h->disk_len > h->hw_disk)
+                {
+                    h->hw_disk = h->disk_len;
+                }
+                pthread_cond_signal (&h->not_empty);
+                pthread_mutex_unlock (&h->buf_lock);
+            }
+            else
+            {
+                /* Still the data phase: hold this chunk and flush it to the memory
+                 * ring next iteration. Data-phase bytes NEVER touch the reserved
+                 * disk — that is what keeps the reserve intact (design §4.5). */
+                carry_off = 0;
+                carry_len = (size_t) n;
             }
 
             continue;
@@ -1564,6 +1984,32 @@ int begin_backup (CUBRID_BACKUP_INFO* backup_info, void** handle)
                     }
                 }
 
+                /* Arm the observational log-phase parser — only when a disk reserve
+                 * exists (memory-only has nothing to reserve, so the parser would be
+                 * inert). MUST be set up BEFORE the drain thread starts, since the
+                 * drain reads parser state. Alloc failure degrades to single-mode. */
+                if (backup_handle->disk_cap > 0)
+                {
+                    backup_handle->parser.gh = malloc ((size_t) CUB_BK_HEADER_STRUCT);
+
+                    if (backup_handle->parser.gh == NULL)
+                    {
+                        PRINT_LOG_WARN ("parser header alloc failed; log-phase detection disabled\n");
+                        backup_handle->parser.st = PS_DISABLED;
+                        backup_handle->parser_on = false;
+                    }
+                    else
+                    {
+                        backup_handle->parser.st           = PS_GATE;
+                        backup_handle->parser.need         = (size_t) CUB_BK_HEADER_STRUCT;
+                        backup_handle->parser.got          = 0;
+                        backup_handle->parser.skip         = 0;
+                        backup_handle->parser.saw_data_vol = 0;
+                        backup_handle->parser.bkpagesize   = 0;
+                        backup_handle->parser_on           = true;
+                    }
+                }
+
                 /* start the drain with SIGCHLD blocked so it never steals the
                  * child-exit signal from backup_thread's sigtimedwait(). */
                 sigemptyset (&block_set);
@@ -1583,6 +2029,16 @@ int begin_backup (CUBRID_BACKUP_INFO* backup_info, void** handle)
                     free (backup_handle->mem_buf);
                     backup_handle->mem_buf = NULL;
                     backup_handle->mem_cap = 0;
+
+                    /* no drain to run the parser; drop its buffer now (finalize
+                     * also guards this) and disable it. */
+                    if (backup_handle->parser.gh != NULL)
+                    {
+                        free (backup_handle->parser.gh);
+                        backup_handle->parser.gh = NULL;
+                    }
+                    backup_handle->parser.st = PS_DISABLED;
+                    backup_handle->parser_on = false;
                 }
                 else
                 {
@@ -1688,6 +2144,16 @@ int end_backup (BACKUP_HANDLE* backup_handle)
     {
         pthread_join (backup_handle->drain_thread, NULL);
         backup_handle->drain_started = false;
+    }
+
+    if (backup_handle->buffering_enabled)
+    {
+        PRINT_LOG_INFO ("tiered buffer summary: log_phase=%d spilled=%d hw_mem=%zu "
+                        "hw_disk=%lld wait_cnt=%lu lookahead=%lu bytes_total=%lld\n",
+                        (int) backup_handle->phase_pub, (int) backup_handle->spilled,
+                        backup_handle->hw_mem, backup_handle->hw_disk,
+                        backup_handle->wait_cnt, backup_handle->lookahead_cnt,
+                        backup_handle->bytes_total);
     }
 
     if (IS_FAILURE (close_fifo (BACKUP_HANDLE_TYPE, backup_handle)))

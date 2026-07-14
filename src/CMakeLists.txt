@@ -44,7 +44,11 @@ add_library(${PROJECT_NAME} SHARED ${CUBRID_BACKUP_API_SRCS})
 set_target_properties(${PROJECT_NAME}
                       PROPERTIES
                           SOVERSION "${CUBRID_BACKUP_API_MAJOR_VER}.${CUBRID_BACKUP_API_MINOR_VER}"
-                          PUBLIC_HEADER "${CMAKE_SOURCE_DIR}/include/backup_api.h")
+                          PUBLIC_HEADER "${CMAKE_SOURCE_DIR}/include/backup_api.h"
+                          # C11 required: the vendored backup-format header pins the
+                          # on-wire layout with _Static_assert (ABI-drift firewall).
+                          C_STANDARD 11
+                          C_STANDARD_REQUIRED ON)
 
 # The library itself now spawns the drain thread, so link pthread explicitly
 # instead of relying on the loading executable to pull it in.

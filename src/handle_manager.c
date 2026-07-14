@@ -119,6 +119,20 @@ int initialize_backup_handle (BACKUP_HANDLE* backup_handle)
     backup_handle->wait_us_total = 0;
     backup_handle->bytes_total   = 0;
 
+    /* log-phase parser: reset only (gh is malloc'd in begin_backup, freed in
+     * finalize_backup_handle). Start disabled; begin_backup arms it. */
+    backup_handle->parser.st           = PS_DISABLED;
+    backup_handle->parser.need         = 0;
+    backup_handle->parser.got          = 0;
+    backup_handle->parser.skip         = 0;
+    backup_handle->parser.saw_data_vol = 0;
+    backup_handle->parser.bkpagesize   = 0;
+    backup_handle->parser.gh           = NULL;
+    backup_handle->parser_on           = false;
+    backup_handle->log_phase           = false;
+    backup_handle->phase_pub           = false;
+    backup_handle->lookahead_cnt       = 0;
+
     return SUCCESS;
 }
 
@@ -186,6 +200,13 @@ int finalize_backup_handle (BACKUP_HANDLE* backup_handle)
     if (backup_handle->mem_buf != NULL)
     {
         free (backup_handle->mem_buf);
+    }
+
+    /* free the parser's header-accumulation buffer (malloc'd in begin_backup) */
+    if (backup_handle->parser.gh != NULL)
+    {
+        free (backup_handle->parser.gh);
+        backup_handle->parser.gh = NULL;
     }
 
     initialize_backup_handle (backup_handle);
