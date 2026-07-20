@@ -2,22 +2,15 @@
 #define _CUBRID_BACKUP_FORMAT_H_
 
 /*
- * Vendored, PINNED snapshot of the CUBRID server backup-stream on-wire format,
- * used ONLY by the observational log-phase parser (see backup_core.c).
+ * Vendored snapshot of the CUBRID server backup-stream on-wire format, used ONLY
+ * by the observational log-phase parser (see backup_core.c). Pinned to CUBRID
+ * v11.3 (format stable through 11.5); each constant is annotated with its server
+ * origin. These are SERVER INTERNALS, NOT an API contract: if the server backup
+ * format changes, this file MUST be re-verified. The _Static_assert block turns
+ * layout drift on the build host into a build failure; a mismatch that slips the
+ * build still degrades safely at runtime (self-check -> parser disabled -> fallback).
  *
- * Source of truth: CUBRID v11.3 (the API's target server version). The struct
- * layouts and every offset-determining constant below were verified byte-for-byte
- * against the `v11.3` release tag (src/storage/file_io.{c,h},
- * src/transaction/log_volids.hpp, src/storage/storage_common.h) and confirmed
- * unchanged through the 11.5.0 line (format stable 11.3->11.5). Every constant
- * below is annotated with its origin. These are SERVER INTERNALS, NOT an API
- * contract: if the server backup format changes, this file MUST be re-verified
- * (see log_cs_parser_design.md §5.1 / §10). The _Static_assert block turns any
- * layout drift on the build host into a HARD BUILD FAILURE rather than a silent
- * runtime misparse; a per-target/server mismatch that slips the build still
- * degrades safely at runtime (self-check -> parser disabled -> fallback).
- *
- * Layout below is for x86-64 LP64 with PATH_MAX==4096 (verified via probe).
+ * Layout is for x86-64 LP64 with PATH_MAX==4096.
  */
 
 #include <stddef.h>
@@ -38,13 +31,14 @@ typedef CUB_INT16 CUB_PGLENGTH;  /* storage_common.h:84  INT16 */
 #define CUB_BK_MAGIC           "CUBRID/Backup_v2"   /* storage_common.h:408 (encodes v2) */
 #define CUB_BK_HDR_VERSION     2             /* file_io.c:210 FILEIO_BACKUP_CURRENT_HEADER_VERSION */
 #define CUB_BK_ZIP_LZ4         3             /* file_io.h:109 FILEIO_ZIP_LZ4_METHOD ordinal */
+#define CUB_BK_ZIP_NONE        0             /* file_io.h:107 FILEIO_ZIP_NONE_METHOD (uncompressed: fixed-stride walk) */
 #define CUB_BK_UNDEF_LEVEL     3             /* file_io.h:101 (previnfo[] size) */
 
 /* on-wire page-id sentinels (file_io.c:273-277) */
 #define CUB_BK_START_PAGE_ID       (-2)
 #define CUB_BK_END_PAGE_ID         (-3)
 #define CUB_BK_FILE_START_PAGE_ID  (-4)
-#define CUB_BK_FILE_END_PAGE_ID    (-5)   /* NOTE: emitted COMPRESSED, never a raw tag */
+#define CUB_BK_FILE_END_PAGE_ID    (-5)   /* LZ4: compressed, never a raw tag. NONE: raw tag on a bkpagesize+OVERHEAD unit. */
 #define CUB_BK_VOL_CONT_PAGE_ID    (-6)
 
 /* volids of streamed FILE_STARTs (log_volids.hpp) */
@@ -139,14 +133,15 @@ typedef enum
 
 typedef struct bk_parser
 {
-  CUB_PSTATE st;
-  size_t     need;          /* bytes still to accumulate for the current field */
-  size_t     got;           /* bytes accumulated into acc[]/gh so far          */
-  long long  skip;          /* bytes still to discard                          */
-  int        saw_data_vol;  /* a FILE_START with volid>=0 has passed           */
-  int        bkpagesize;    /* from the gated header; buf_len self-check bound */
-  char      *gh;            /* malloc(CUB_BK_HEADER_STRUCT); accumulates header */
-  unsigned char acc[24];    /* >= CUB_BK_FS_PEEK(18)                           */
+  CUB_PSTATE state;
+  size_t     need_bytes;      /* bytes still to accumulate for the current field */
+  size_t     got_bytes;       /* bytes accumulated into header_accum[]/global_header so far */
+  long long  skip_bytes;      /* bytes still to discard                          */
+  int        saw_data_volume; /* a FILE_START with volid>=0 has passed           */
+  int        backup_page_size;/* from the gated header; buf_len self-check bound */
+  int        compressed;      /* gated zip_method: 1=LZ4 (self-delimiting), 0=NONE (fixed stride) */
+  char      *global_header;   /* malloc(CUB_BK_HEADER_STRUCT); accumulates header */
+  unsigned char header_accum[24]; /* >= CUB_BK_FS_PEEK(18)                       */
 } BK_PARSER;
 
 #endif /* _CUBRID_BACKUP_FORMAT_H_ */

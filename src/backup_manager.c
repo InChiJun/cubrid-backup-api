@@ -26,6 +26,15 @@ BACKUP_MANAGER* backup_mgr = &backup_manager;
  * the static log_buffer and the append to log_fp are shared state. */
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* fork-safety: the backup child forked in execute_backup runs briefly before
+ * execv and may call print_log, which takes log_mutex. If another thread (e.g. the
+ * drain) held log_mutex at the instant of fork, the child would inherit it locked
+ * and self-deadlock. These pthread_atfork handlers acquire it around fork so the
+ * child inherits a consistent mutex and then unlocks it. */
+static void log_atfork_prepare (void) { pthread_mutex_lock (&log_mutex); }
+static void log_atfork_parent  (void) { pthread_mutex_unlock (&log_mutex); }
+static void log_atfork_child   (void) { pthread_mutex_unlock (&log_mutex); }
+
 static
 int make_log_header (char* buf, size_t buf_len, const char *prefix_str)
 {
@@ -378,7 +387,7 @@ int init_default_backup_option (void)
     backup_opt->sleep_msecs        = 0;     /* [M] */
 
     backup_opt->fifo_size              = 64 * 1024;          /* 64KB               */
-    backup_opt->buffer_memory_size     = 64LL * 1024 * 1024; /* 64MB, buffering ON */
+    backup_opt->buffer_memory_size     = 0;                  /* buffering OFF (opt-in): set >0 to enable the drain/tiered-buffer path */
     backup_opt->buffer_disk_limit      = 0;                  /* disk tier off      */
     backup_opt->buffer_disk_path[0]    = '\0';
     backup_opt->buffer_disk_keep_spool = false;
@@ -984,6 +993,14 @@ error:
 
 int start_backup_manager (void)
 {
+    static bool atfork_registered = false;
+
+    if (!atfork_registered)                 /* register once per process, before any backup fork */
+    {
+        (void) pthread_atfork (log_atfork_prepare, log_atfork_parent, log_atfork_child);
+        atfork_registered = true;
+    }
+
     if (IS_FAILURE (open_log_file ()))
     {
         //PRINT_LOG_ERR (ERR_INFO);

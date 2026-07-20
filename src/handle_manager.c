@@ -23,6 +23,16 @@ int initialize_handle_manager (void)
         goto error;
     }
 
+    /* Seed fd sentinels to -1 BEFORE any fallible init below: the static handle
+     * is zero-initialized, so if an init fails (goto error -> finalize) the fd
+     * fields must already be -1, else finalize would close() fd 0. */
+    handle_mgr->backup_handle.fifo_fd       = -1;
+    handle_mgr->backup_handle.disk_fd       = -1;
+    handle_mgr->backup_handle.cancel_efd    = -1;
+    handle_mgr->backup_handle.mem_buf       = NULL;
+    handle_mgr->backup_handle.drain_started = false;
+    handle_mgr->restore_handle.restore_fd   = -1;
+
     /* tiered-buffer sync objects: init once per process (the handle is reused
      * across begin/end, so these must NOT be re-init'd per backup). */
     if (IS_FAILURE (pthread_mutex_init (&handle_mgr->backup_handle.buf_lock, NULL)))
@@ -42,15 +52,6 @@ int initialize_handle_manager (void)
         PRINT_LOG_ERR (ERR_INFO);
         goto error;
     }
-
-    /* Seed fd sentinels to -1 up front: the static handle is zero-initialized,
-     * so without this a finalize before the first begin would close() fd 0. */
-    handle_mgr->backup_handle.fifo_fd       = -1;
-    handle_mgr->backup_handle.disk_fd       = -1;
-    handle_mgr->backup_handle.cancel_efd    = -1;
-    handle_mgr->backup_handle.mem_buf       = NULL;
-    handle_mgr->backup_handle.drain_started = false;
-    handle_mgr->restore_handle.restore_fd   = -1;
 
     return SUCCESS;
 
@@ -112,26 +113,27 @@ int initialize_backup_handle (BACKUP_HANDLE* backup_handle)
     backup_handle->producer_eof = false;
     backup_handle->buf_error    = false;
 
-    backup_handle->hw_mem        = 0;
-    backup_handle->hw_disk       = 0;
-    backup_handle->spilled       = false;
-    backup_handle->wait_cnt      = 0;
-    backup_handle->wait_us_total = 0;
-    backup_handle->bytes_total   = 0;
+    backup_handle->mem_high_water  = 0;
+    backup_handle->disk_high_water = 0;
+    backup_handle->spilled         = false;
+    backup_handle->wait_count      = 0;
+    backup_handle->wait_us_total   = 0;
+    backup_handle->bytes_total     = 0;
 
-    /* log-phase parser: reset only (gh is malloc'd in begin_backup, freed in
-     * finalize_backup_handle). Start disabled; begin_backup arms it. */
-    backup_handle->parser.st           = PS_DISABLED;
-    backup_handle->parser.need         = 0;
-    backup_handle->parser.got          = 0;
-    backup_handle->parser.skip         = 0;
-    backup_handle->parser.saw_data_vol = 0;
-    backup_handle->parser.bkpagesize   = 0;
-    backup_handle->parser.gh           = NULL;
-    backup_handle->parser_on           = false;
-    backup_handle->log_phase           = false;
-    backup_handle->phase_pub           = false;
-    backup_handle->lookahead_cnt       = 0;
+    /* log-phase parser: reset only (global_header is malloc'd in begin_backup,
+     * freed in finalize_backup_handle). Start disabled; begin_backup arms it. */
+    backup_handle->parser.state            = PS_DISABLED;
+    backup_handle->parser.need_bytes       = 0;
+    backup_handle->parser.got_bytes        = 0;
+    backup_handle->parser.skip_bytes       = 0;
+    backup_handle->parser.saw_data_volume  = 0;
+    backup_handle->parser.backup_page_size = 0;
+    backup_handle->parser.compressed       = 0;
+    backup_handle->parser.global_header    = NULL;
+    backup_handle->parser_on               = false;
+    backup_handle->log_phase               = false;
+    backup_handle->phase_published         = false;
+    backup_handle->lookahead_count         = 0;
 
     return SUCCESS;
 }
@@ -159,7 +161,7 @@ int finalize_backup_handle (BACKUP_HANDLE* backup_handle)
 
     /* tiered-buffer: wake a parked drain (cond_wait / poll) and join it BEFORE
      * the fifo is closed (the drain reads fifo_fd). No-op until a drain is
-     * spawned (drain_started stays false in M-1..M-3). */
+     * spawned. */
     if (backup_handle->drain_started)
     {
         pthread_mutex_lock (&backup_handle->buf_lock);
@@ -203,10 +205,10 @@ int finalize_backup_handle (BACKUP_HANDLE* backup_handle)
     }
 
     /* free the parser's header-accumulation buffer (malloc'd in begin_backup) */
-    if (backup_handle->parser.gh != NULL)
+    if (backup_handle->parser.global_header != NULL)
     {
-        free (backup_handle->parser.gh);
-        backup_handle->parser.gh = NULL;
+        free (backup_handle->parser.global_header);
+        backup_handle->parser.global_header = NULL;
     }
 
     initialize_backup_handle (backup_handle);
