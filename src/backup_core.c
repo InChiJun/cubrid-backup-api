@@ -1,4 +1,5 @@
 #include <sys/wait.h>
+#include <sys/prctl.h>
 #include <errno.h>
 #include <poll.h>
 #include <stdint.h>
@@ -504,7 +505,10 @@ int open_fifo (HANDLE_TYPE handle_type, void* handle)
     {
         backup_handle = (BACKUP_HANDLE *)handle;
 
-        backup_handle->fifo_fd = open (backup_handle->fifo_path, O_RDONLY | O_NONBLOCK);
+        /* O_CLOEXEC: the forked backupdb must NOT inherit this read end — an
+         * inherited reader keeps the FIFO alive after a client crash, so
+         * backupdb never gets EPIPE and blocks in write() forever (orphan). */
+        backup_handle->fifo_fd = open (backup_handle->fifo_path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
 
         if (backup_handle->fifo_fd == -1)
         {
@@ -684,10 +688,16 @@ int execute_cubrid_backupdb (BACKUP_HANDLE* backup_handle)
         argv[idx ++] = thread_count;
     }
 
-    /* --compress */
+    /* --compress / --no-compress: 11.3+ backupdb compresses (LZ4) BY DEFAULT,
+     * so omitting -z does NOT give an uncompressed stream — compress=false
+     * must pass --no-compress explicitly or the option silently means LZ4. */
     if (backup_handle->compress == true)
     {
         argv[idx ++] = "-z";
+    }
+    else
+    {
+        argv[idx ++] = "--no-compress";
     }
 
     /* --except-active-log */
@@ -891,11 +901,13 @@ error:
     return FAILURE;
 }
 
+static void buf_mark_error (BACKUP_HANDLE* backup_handle);
+
 static
 void* execute_backup (void* handle)
 {
-    BACKUP_HANDLE* backup_handle;
-    pid_t backup_pid;
+    BACKUP_HANDLE* backup_handle = NULL;
+    pid_t backup_pid = -1;
 
     if (IS_NULL (handle))
     {
@@ -917,6 +929,16 @@ void* execute_backup (void* handle)
     }
     else if (backup_pid == 0) /* child process */
     {
+        /* Die with the client: if the client is killed before backupdb opens
+         * the FIFO write end, that open(O_WRONLY) blocks forever (no reader
+         * will ever come; EPIPE only fires on write) — an unkillable orphan.
+         * PDEATHSIG survives execv, so the kernel reaps us in every phase. */
+        prctl (PR_SET_PDEATHSIG, SIGKILL);
+        if (getppid () == 1)   /* parent already died between fork and prctl */
+        {
+            _exit (1);
+        }
+
         if (IS_FAILURE (execute_cubrid_backupdb (backup_handle)))
         {
             PRINT_LOG_ERR (ERR_INFO);
@@ -951,6 +973,23 @@ void* execute_backup (void* handle)
 error:
 
     set_thread_state (BACKUP_HANDLE_TYPE, backup_handle, THREAD_STATE_EXIT_WITH_ERROR);
+
+    /* If backupdb died without ever opening the FIFO write end, the drain is
+     * parked in poll() (a never-opened FIFO raises no event) and the reader in
+     * not_empty — neither can observe this failure. Mark the buffer failed
+     * (wakes the reader) and poke cancel_efd (wakes the drain) so the API
+     * surfaces FAILURE instead of hanging. Parent thread only (not the fork
+     * child: post-fork locks are unsafe there). */
+    if (backup_handle != NULL && backup_pid != 0 && backup_handle->buffering_enabled)
+    {
+        buf_mark_error (backup_handle);
+
+        if (backup_handle->cancel_efd != -1)
+        {
+            uint64_t one = 1;
+            (void) write (backup_handle->cancel_efd, &one, sizeof (one));
+        }
+    }
 
     pthread_exit (NULL);
 }
