@@ -4,8 +4,8 @@
 /*
  * Vendored snapshot of the CUBRID server backup-stream on-wire format, used ONLY
  * by the observational log-phase parser (see backup_core.c). Pinned to CUBRID
- * v11.3 (format stable through 11.5); each constant is annotated with its server
- * origin. These are SERVER INTERNALS, NOT an API contract: if the server backup
+ * v11.3 (format stable through 11.5); constants carry their server symbol names
+ * where applicable. These are SERVER INTERNALS, NOT an API contract: if the server backup
  * format changes, this file MUST be re-verified. The _Static_assert block turns
  * layout drift on the build host into a build failure; a mismatch that slips the
  * build still degrades safely at runtime (self-check -> parser disabled -> fallback).
@@ -17,38 +17,38 @@
 #include <stdint.h>
 #include <limits.h>
 
-/* ── server scalar typedefs (storage_common.h) ── */
+/* ── server scalar typedefs ── */
 typedef int32_t CUB_INT32;
 typedef int64_t CUB_INT64;
 typedef int16_t CUB_INT16;
-typedef CUB_INT32 CUB_PAGEID;    /* storage_common.h:73  INT32 */
-typedef CUB_INT16 CUB_VOLID;     /* storage_common.h:70  INT16 */
-typedef CUB_INT16 CUB_PGLENGTH;  /* storage_common.h:84  INT16 */
+typedef CUB_INT32 CUB_PAGEID;    /* INT32 */
+typedef CUB_INT16 CUB_VOLID;     /* INT16 */
+typedef CUB_INT16 CUB_PGLENGTH;  /* INT16 */
 
-/* ── constants (file_io.{c,h}, storage_common.h, release_string.h) ── */
-#define CUB_MAGIC_MAX_LENGTH   25            /* storage_common.h:402 */
-#define CUB_REL_MAX_RELEASE    15            /* release_string.h:31  */
-#define CUB_BK_MAGIC           "CUBRID/Backup_v2"   /* storage_common.h:408 (encodes v2) */
-#define CUB_BK_HDR_VERSION     2             /* file_io.c:210 FILEIO_BACKUP_CURRENT_HEADER_VERSION */
-#define CUB_BK_ZIP_LZ4         3             /* file_io.h:109 FILEIO_ZIP_LZ4_METHOD ordinal */
-#define CUB_BK_ZIP_NONE        0             /* file_io.h:107 FILEIO_ZIP_NONE_METHOD (uncompressed: fixed-stride walk) */
-#define CUB_BK_UNDEF_LEVEL     3             /* file_io.h:101 (previnfo[] size) */
+/* ── constants ── */
+#define CUB_MAGIC_MAX_LENGTH   25
+#define CUB_REL_MAX_RELEASE    15
+#define CUB_BK_MAGIC           "CUBRID/Backup_v2"   /* encodes v2 */
+#define CUB_BK_HDR_VERSION     2             /* FILEIO_BACKUP_CURRENT_HEADER_VERSION */
+#define CUB_BK_ZIP_LZ4         3             /* FILEIO_ZIP_LZ4_METHOD ordinal */
+#define CUB_BK_ZIP_NONE        0             /* FILEIO_ZIP_NONE_METHOD (uncompressed: fixed-stride walk) */
+#define CUB_BK_UNDEF_LEVEL     3             /* previnfo[] size */
 
-/* on-wire page-id sentinels (file_io.c:273-277) */
+/* on-wire page-id sentinels */
 #define CUB_BK_START_PAGE_ID       (-2)
 #define CUB_BK_END_PAGE_ID         (-3)
 #define CUB_BK_FILE_START_PAGE_ID  (-4)
 #define CUB_BK_FILE_END_PAGE_ID    (-5)   /* LZ4: compressed, never a raw tag. NONE: raw tag on a bkpagesize+OVERHEAD unit. */
 #define CUB_BK_VOL_CONT_PAGE_ID    (-6)
 
-/* volids of streamed FILE_STARTs (log_volids.hpp) */
-#define CUB_LOG_DBFIRST_VOLID   0      /* :38  first data volume                 */
-#define CUB_LOG_ARCHIVE_VOLID   (-20)  /* :53  archive log = negative-volid floor */
-#define CUB_LOG_DWB_VOLID       (-22)  /* :57  robustness floor for volid_valid   */
-#define CUB_LOG_MAX_DBVOLID     32766  /* :34  VOLID_MAX-1                         */
+/* volids of streamed FILE_STARTs */
+#define CUB_LOG_DBFIRST_VOLID   0      /* first data volume                 */
+#define CUB_LOG_ARCHIVE_VOLID   (-20)  /* archive log = negative-volid floor */
+#define CUB_LOG_DWB_VOLID       (-22)  /* robustness floor for volid_valid   */
+#define CUB_LOG_MAX_DBVOLID     32766  /* VOLID_MAX-1                         */
 
-/* max plausible bkpagesize = db_iopagesize(<=16K) * FILEIO_FULL_LEVEL_EXP(32)
- * (file_io.c:197,7225). Upper bound for the compressed buf_len self-check. */
+/* max plausible bkpagesize = db_iopagesize(<=16K) * FILEIO_FULL_LEVEL_EXP(32).
+ * Upper bound for the compressed buf_len self-check. */
 #define CUB_BK_MAX_BKPAGESIZE   524288
 
 /* PINNED on-wire sizes (probe-verified, x86-64 LP64, PATH_MAX 4096) */
@@ -56,13 +56,13 @@ typedef CUB_INT16 CUB_PGLENGTH;  /* storage_common.h:84  INT16 */
 #define CUB_BK_HEADER_STRUCT    12464   /* sizeof(FILEIO_BACKUP_HEADER)            */
 #define CUB_BK_HEADER_IO_SIZE   13312   /* GET_NEXT_1K_SIZE(struct): on-wire block */
 #define CUB_BK_FILE_UNIT        4120    /* FILEIO_BACKUP_FILE_HEADER_PAGE_SIZE     */
-#define CUB_BK_PAGE_OVERHEAD    12      /* FILEIO_BACKUP_PAGE_OVERHEAD (file_io.c:214) */
+#define CUB_BK_PAGE_OVERHEAD    12      /* FILEIO_BACKUP_PAGE_OVERHEAD */
 #define CUB_BK_PAGE_IOPAGE_OFF  8       /* offsetof(FILEIO_BACKUP_PAGE, iopage)    */
 #define CUB_BK_WIRE_NBYTES_OFF  8       /* page prefix(8) + file_header nbytes(0)  */
 #define CUB_BK_WIRE_VOLID_OFF   16      /* page prefix(8) + file_header volid(8)   */
 #define CUB_BK_FS_PEEK          18      /* bytes to inspect: tag..volid(16..17)    */
 
-/* ── vendored struct: global backup header (file_io.h:280-313) ──
+/* ── vendored struct: global backup header ──
  * Copied verbatim for the gate cast; _Static_assert pins its layout. */
 typedef struct { CUB_INT64 pageid:48; CUB_INT64 offset:16; } CUB_LOG_LSA;          /* 8B */
 typedef struct { CUB_INT64 at_time; CUB_LOG_LSA lsa; } CUB_BK_RECORD_INFO;         /* 16B */
@@ -93,7 +93,7 @@ typedef struct cub_bkup_header
   int        skip_activelog;
 } CUB_BKUP_HEADER;
 
-/* file (FILE_START) header (file_io.c:351-358) — read via wire offsets, not cast */
+/* file (FILE_START) header — read via wire offsets, not cast */
 typedef struct cub_bkup_file_header
 {
   CUB_INT64 nbytes;

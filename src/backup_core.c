@@ -720,7 +720,7 @@ int execute_cubrid_backupdb (BACKUP_HANDLE* backup_handle)
 
     argv[idx] = '\0';
 
-    // tech 요청으로 cub_admin -> cubrid 로 변경: cubrid_utility.log 에 기록 남기기 위해
+    // Changed cub_admin -> cubrid per tech request: to leave a record in cubrid_utility.log
     //snprintf (cub_admin, PATH_MAX, "%s/bin/cub_admin", backup_mgr->cubrid_home);
     snprintf (cub_admin, PATH_MAX, "%s/bin/cubrid", backup_mgr->cubrid_home);
 
@@ -768,7 +768,7 @@ void kill_process_group (pid_t pgid)
 
     //printf ("pid: %d, pgid: %d\n", getpid (), getpgid (getpid ()));
 
-    // backup-api library 자체는 죽으면 안돼기 때문에
+    // because the backup-api library itself must not die
     sigaction (SIGTERM, &act, &old_act);
 
     killpg (pgid, SIGTERM);
@@ -776,10 +776,10 @@ void kill_process_group (pid_t pgid)
     sigaction (SIGTERM, &old_act, NULL);
 
 #if 0
-    // FAILURE: Has been interrupted. 를 cubrid_utility.log 에 남기기 위해
-    // SIGINT 를 사용하려고 했으나, cub_admin 에서 SIG_INT 핸들러를 등록해두어서
-    // cub_admin 이 바로 죽지 않는다.
-    // FAILURE: Has been interrupted. 로그를 남긴다는 것 자체가 정상 종료(예외처리) 했다는 것이다.
+    // To leave "FAILURE: Has been interrupted." in cubrid_utility.log we
+    // tried to use SIGINT, but cub_admin registers a SIGINT handler, so
+    // cub_admin does not die immediately.
+    // Leaving the "FAILURE: Has been interrupted." log itself means it terminated normally (handled).
     sigaction (SIGINT, &act, &old_act);
 
     killpg (pgid, SIGINT);
@@ -794,7 +794,7 @@ void zombie_handler()
     int status;
     int spid;
     spid = wait(&status);
-    printf("자식프로세스 wait 성공 \n");
+    printf("child process wait succeeded \n");
     printf("================================\n");
     printf("PID         : %d\n", spid);
     printf("Exit Value  : %d\n", WEXITSTATUS(status));
@@ -816,18 +816,18 @@ int check_backup_process_status (BACKUP_HANDLE* backup_handle, pid_t backup_pid)
     wait_timeout.tv_sec  = 1;
     wait_timeout.tv_nsec = 0;
 
-    // SIGCHLD에 대한 빈 핸들러를 등록한 이유는
-    // 아래 sigtimedwait () 에서 cubrid의 종료를 감지하지 못하기 때문이다.
-    // 따라서 cubrid 유틸은 <defunct> 상태가 되며,
-    // cubrid_backup_read () 에서는 백업 쓰레드가 종료되었다는 사실을 모르게 된다.
-    // 테스트 용으로 zombie_handler 를 등록했는데,
-    // 원하는대로 cubrid 유틸 종료시 SIGCHLD를 던저주며, 이를 catch할 수 있게 됐다.
-    // 이유는 아직 못찾았다.
+    // We register an empty handler for SIGCHLD because otherwise
+    // the sigtimedwait () below fails to detect cubrid's termination.
+    // As a result the cubrid utility ends up in a <defunct> state, and
+    // cubrid_backup_read () does not learn that the backup thread has terminated.
+    // We registered zombie_handler for testing, and as intended it
+    // raises SIGCHLD when the cubrid utility exits, so we can catch it.
+    // The reason why is not yet understood.
     signal(SIGCHLD, (void *)zombie_handler);
 
-    // 현재 cub_admin 을 직접 fork 하는 방식을 사용 중인데 log를 cubrid 유틸에서 남기기 때문에
-    // 기술 본부에서 참조하는 cubrid_utility.log 로그에 백업 관련 기록이 남지 않는다.
-    // 따러서 cubrid 를 fork 하는 방식으로 바꾸고 kill 시 다 죽이자 후손까지
+    // We currently fork cub_admin directly, but since the log is written by the cubrid utility,
+    // backup-related records do not appear in the cubrid_utility.log referenced by the tech division.
+    // So switch to forking cubrid instead, and on kill take everything down, descendants included.
     while (true)   
     {
         //sigemptyset (&sa_mask);
@@ -955,16 +955,16 @@ void* execute_backup (void* handle)
     }
 
     // thread -> backup process
-    // - thread 종료되었다고 ... backup_process 종료된건 아니다.
-    // - 이 thread --fork--> backup process 구조는 검증 후 개선이 필요할 듯 하다.
-    //   - 이 구조를 취한건 cubrid backup 유틸리티에서 자신을 실행한 thread id
-    //     를 검증하는 부분이 있기 때문이다.
-    //   - thread 로 백업 수행(libcubridsa.so 링크) 후 백업 수행 (백업 마다 thread 생성 or 한 쓰레드)
-    //     cubrid_backup_finalize () 호출 시 boot_shutdown_client_at_exit () (atexit () 등록 됨)
-    //     함수에서 coredump 발생
-    //     이유는 백업은 thread 생성해서 수행되고, cubrid_backup_finalize () 호출은 main thread가
-    //     호출하기 때문에 두 thread id가 달라서 발생된다고 분석된 상태.
-    //     별도의 thread나 process를 생성해야 하는 이유는 사용자 레벨에서의 hang 방지.
+    // - The thread terminating does not mean backup_process has terminated.
+    // - This thread --fork--> backup process structure likely needs review and improvement.
+    //   - We took this structure because the cubrid backup utility has a part that
+    //     validates the thread id that launched it.
+    //   - Running the backup on a thread (linking libcubridsa.so) (a thread per backup, or one thread):
+    //     on cubrid_backup_finalize () the boot_shutdown_client_at_exit () (registered via atexit ())
+    //     function triggers a coredump.
+    //     The analysis: the backup runs on a created thread while cubrid_backup_finalize () is
+    //     called by the main thread, so the two thread ids differ, which causes it.
+    //     A separate thread or process must be created to prevent a hang at the user level.
     //printf ("must hit here 3\n");
     set_thread_state (BACKUP_HANDLE_TYPE, backup_handle, THREAD_STATE_EXIT);
 
@@ -2171,11 +2171,10 @@ int end_backup (BACKUP_HANDLE* backup_handle)
         goto error;
     }
 
-    // mutex 잡기전에 handle validation을 먼저 수행하도록 변경한다.
-    // 사유는 쓰레기 (NULL 아닌) 값을 handle로 전달할 경우
+    // Perform handle validation before acquiring the mutex.
+    // Reason: passing a garbage (non-NULL) value as the handle can cause
     // 1. hang
     // 2. seg fault
-    // 발생할 수 있다.
     if (IS_FAILURE (validate_handle (BACKUP_HANDLE_TYPE, backup_handle)))
     {
         PRINT_LOG_ERR (ERR_INFO);
@@ -2491,7 +2490,7 @@ int open_restore_file (RESTORE_HANDLE* restore_handle)
     }
 
 #if 0
-    // 파일이 존재하면 따로 검사하지 말고, overwrite 해버리자
+    // If the file exists, don't check separately; just overwrite it
     if (IS_SUCCESS (access (restore_file, F_OK)))
     {
         PRINT_LOG_ERR (ERR_INFO);

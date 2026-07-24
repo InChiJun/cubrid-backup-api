@@ -145,17 +145,16 @@ int finalize_backup_handle (BACKUP_HANDLE* backup_handle)
     {
         backup_handle->is_cancel = true;
 
-        // thread 상태 변경 후 create 하기 때문에 생성 실패시 hang 발생할 수 있다.
-        // (생성 실패하였는데, 상태는 THREAD_STATE_RUNNING 이기 때문에)
-        // 상태를 먼저 변경하는 이유는
-        // cubrid_backup_finalize () 호출 시 thread 상태가 THREAD_STATE_RUNNING 로 바뀌기 전이라면,
-        // 이 부분을 pass 하고, 내부 handle을 free하기 때문에
-        // 서버에서 아래와 같은 에러가 발생한다.
+        // We create the thread after changing its state, so a creation failure can hang.
+        // (creation failed, yet the state is already THREAD_STATE_RUNNING)
+        // The reason we change the state first: if cubrid_backup_finalize () is called
+        // before the thread state becomes THREAD_STATE_RUNNING, this part is skipped and
+        // the internal handle is freed, so the server raises the error below.
         // ERROR: Destination-path does not exist or is not a directory.
         // 
-        // 이는 handle에 있던 -D (fifo) 경로를 아래 initialize_backup_handle () 함수에서
-        // 초기화하기 때문이다.
-        // 이 구조적인 문제는 다음 버전에서 개선하기로 한다.
+        // That happens because the -D (fifo) path stored in the handle is reset by the
+        // initialize_backup_handle () function below.
+        // This structural problem is left to be improved in a future version.
         pthread_join (backup_handle->backup_thread, NULL);
     }
 

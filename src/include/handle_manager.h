@@ -55,25 +55,25 @@ struct backup_handle
     char db_name[MAX_DB_NAME_LEN + 1];
 
     /* ── tiered buffer ── */
-    bool buffering_enabled;   /* mem_buf alloc 성공 시 true; false=구 direct-FIFO 경로 */
-    bool drain_started;       /* drain_thread join 가드 (THREAD_STATE는 backup_thread 전용) */
-    volatile bool stop;       /* 통합 종료 신호 (cancel/error/eof); read lock-free in drain */
-    int  cancel_efd;          /* eventfd: poll 중 drain 즉시 기상; -1 = 미사용 */
+    bool buffering_enabled;   /* true when mem_buf alloc succeeds; false = legacy direct-FIFO path */
+    bool drain_started;       /* drain_thread join guard (THREAD_STATE is for backup_thread only) */
+    volatile bool stop;       /* unified stop signal (cancel/error/eof); read lock-free in drain */
+    int  cancel_efd;          /* eventfd: wakes drain immediately during poll; -1 = unused */
 
-    char*  mem_buf;           /* malloc(mem_cap), 메모리 링; NULL = 미할당 */
+    char*  mem_buf;           /* malloc(mem_cap), memory ring; NULL = not allocated */
     size_t mem_cap;
     size_t mem_len;
     size_t mem_head;
     size_t mem_tail;
 
-    int       disk_fd;        /* spool 파일 (Phase 2); -1 = 미사용 */
+    int       disk_fd;        /* spool file (Phase 2); -1 = unused */
     long long disk_cap;
     long long disk_len;
     long long disk_head;
     long long disk_tail;
 
-    bool producer_eof;        /* drain: FIFO 정상 EOF 도달 */
-    bool buf_error;           /* 완충 경로 에러/취소 */
+    bool producer_eof;        /* drain: FIFO reached normal EOF */
+    bool buf_error;           /* buffered path error/cancel */
 
     pthread_t       drain_thread;
     pthread_mutex_t buf_lock;
