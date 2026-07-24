@@ -229,6 +229,70 @@ sleep 1
 
 echo ""
 
+# ============================================================================
+# == [LIGHT] tiered-buffer / log-phase parser tests ==========================
+# Fast, deterministic additions for the feature/log-phase-parser work. At this
+# 100M `testdb` scale parser_ut is ~instant and backup_tc05 adds ~1 min (it
+# deliberately reads slowly). Both use the same [OK]/[NOK] *_result convention as
+# the cases above, so the final summary picks them up. Each is wrapped in a
+# `timeout` so a hang in the slow-consumer path fails loudly instead of stalling
+# the whole gate.
+#   - parser_ut   : deterministic unit tests for the observational log-phase
+#                   parser + memory ring (synthetic streams, NO server needed).
+#   - backup_tc05 : slow consumer drives the tiered buffer (mem -> disk spool ->
+#                   WAIT); the produced backup must still restore byte-for-byte.
+# Heavy / real-environment suites (5GB/150GB accuracy, LOG_CS latency, fault
+# injection, ...) are OPT-IN and live under  testcases/stress/  (see
+# testcases/stress/run_stress.sh) — deliberately kept OUT of this quick gate.
+# ============================================================================
+echo ""
+echo "==run parser_ut (log-phase parser + ring unit tests, no server)"
+timeout 60 ./parser_ut > parser_ut_result 2>&1
+put_rc=$?
+if [ $put_rc -eq 124 ]; then
+	echo "[NOK] parser_ut timed out" >> parser_ut_result
+elif [ $put_rc -eq 0 ]; then
+	echo "[OK] parser_ut (all checks passed)" >> parser_ut_result
+else
+	echo "[NOK] parser_ut (a check failed)" >> parser_ut_result
+fi
+
+echo ""
+echo "==run backup_tc05 (slow-consumer tiered buffer -> byte-identical restore)"
+mkdir -p ./spool
+cat > $CUBRID/conf/cubrid_backup.conf <<EOF
+[backup]
+remove_archive=false
+sa_mode=false
+no_check=true
+thread_count=1
+compress=true
+fifo_size=64KB
+buffer_memory_size=1MB
+buffer_disk_limit=64MB
+buffer_disk_path=./spool
+buffer_disk_keep_spool=false
+EOF
+rm -rf ./backup_dir/* ./restore_dir/* ./spool/*
+timeout 180 ./backup_tc05 $db_name 0 ./backup_dir/${db_name}_bk0v000 3000 4096 > backup_tc05_result 2>&1
+tc05_rc=$?
+if [ $tc05_rc -eq 124 ]; then
+	echo "[NOK] backup_tc05 timed out (possible slow-consumer hang)" >> backup_tc05_result
+elif grep -q "\[OK\]" backup_tc05_result; then
+	./restore_tc01 $db_name 0 ./backup_dir/${db_name}_bk0v000 0 ./restore_dir/ >> backup_tc05_result 2>&1
+	if [ -z "`cmp ./backup_dir/${db_name}_bk0v000 ./restore_dir/${db_name}_bk0v000`" ]; then
+		echo "[OK] backup_tc05 slow-consumer backup restores byte-identical" >> backup_tc05_result
+	else
+		echo "[NOK] backup_tc05 restore byte mismatch" >> backup_tc05_result
+	fi
+else
+	echo "[NOK] backup_tc05 slow-consumer backup failed" >> backup_tc05_result
+fi
+rm -f $CUBRID/conf/cubrid_backup.conf
+rm -rf ./spool
+# == [/LIGHT] ================================================================
+
+echo ""
 echo "==run conf_test"
 echo ""
 sh conf_test.sh $db_name

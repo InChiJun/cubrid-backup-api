@@ -52,6 +52,16 @@ static size_t build_zip (unsigned char* b, int buf_len)
     return 4 + (size_t) buf_len;
 }
 
+/* NONE-mode page-sized unit: bkpagesize+OVERHEAD bytes, leading 4-byte iopageid
+ * tag (data page pageid>=0, or FILE_END -5). */
+static size_t build_none_page (unsigned char* b, int32_t tag, int bkpagesize)
+{
+    size_t sz = (size_t) bkpagesize + CUB_BK_PAGE_OVERHEAD;
+    memset (b, 0xCD, sz);
+    memcpy (b, &tag, 4);
+    return sz;
+}
+
 /* raw 4-byte tag (for anomaly injection) */
 static size_t build_tag (unsigned char* b, int32_t tag)
 {
@@ -63,23 +73,24 @@ static size_t build_tag (unsigned char* b, int32_t tag)
 
 static void arm (BACKUP_HANDLE* h)
 {
-    h->parser.gh = malloc ((size_t) CUB_BK_HEADER_STRUCT);
-    h->parser.st = PS_GATE;
-    h->parser.need = (size_t) CUB_BK_HEADER_STRUCT;
-    h->parser.got = 0;
-    h->parser.skip = 0;
-    h->parser.saw_data_vol = 0;
-    h->parser.bkpagesize = 0;
+    h->parser.global_header = malloc ((size_t) CUB_BK_HEADER_STRUCT);
+    h->parser.state = PS_GATE;
+    h->parser.need_bytes = (size_t) CUB_BK_HEADER_STRUCT;
+    h->parser.got_bytes = 0;
+    h->parser.skip_bytes = 0;
+    h->parser.saw_data_volume = 0;
+    h->parser.backup_page_size = 0;
+    h->parser.compressed = 0;
     h->parser_on = true;
     h->log_phase = false;
-    h->phase_pub = false;
+    h->phase_published = false;
     h->bytes_total = 0;
 }
 
 static void disarm (BACKUP_HANDLE* h)
 {
-    if (h->parser.gh) { free (h->parser.gh); h->parser.gh = NULL; }
-    h->parser.st = PS_DISABLED;
+    if (h->parser.global_header) { free (h->parser.global_header); h->parser.global_header = NULL; }
+    h->parser.state = PS_DISABLED;
     h->parser_on = false;
 }
 
@@ -111,7 +122,7 @@ static void run_scenario (BACKUP_HANDLE* h, const unsigned char* s, size_t n,
         if (expect_disabled)
         {
             snprintf (label, sizeof (label), "%s [chunk=%zu]: parser disabled", name, chunks[c]);
-            CHECK (h->parser.st == PS_DISABLED, label);
+            CHECK (h->parser.state == PS_DISABLED, label);
         }
         disarm (h);
     }
@@ -150,7 +161,11 @@ static int test_mem_ring (BACKUP_HANDLE* h)
         /* pop a pseudo-random chunk and verify it matches the reference FIFO */
         {
             size_t want = (r >> 16) % (sizeof (out));
-            size_t got = mem_ring_pop (h, (char *) out, want);
+            /* exercise the runtime reader path: mem_ring_copy + explicit advance */
+            size_t got = (want < h->mem_len) ? want : h->mem_len;
+            mem_ring_copy (h, (char *) out, h->mem_head, got);
+            h->mem_head = (h->mem_head + got) % h->mem_cap;
+            h->mem_len -= got;
             if (got > 0)
             {
                 if (memcmp (out, ref + cons, got) != 0) { ok = 0; break; }
@@ -238,6 +253,78 @@ int main (void)
     build_fs (s + n, 8192, 0);  n += CUB_BK_FILE_UNIT;
     build_fs (s + n, 4096, -100); n += CUB_BK_FILE_UNIT; /* impossible volid */
     run_scenario (h, s, n, "S9 bad volid->disable", 0, 1);
+
+    printf ("== T13: NONE (uncompressed) fixed-stride walk ==\n");
+
+    /* N1: NONE gh -> volinfo(-5) -> data(0) -> data pages -> FILE_END(-5) -> archive(-20).
+     * Proves: NONE gate accepted, data pages + FILE_END(-5) strided (NOT disabled —
+     * the key difference from LZ4), boundary latched at first neg-volid after data. */
+    n = 0;
+    build_gh (s + n, CUB_BK_HDR_VERSION, CUB_BK_ZIP_NONE, 4096); n += CUB_BK_HEADER_IO_SIZE;
+    build_fs (s + n, 4096, -5);  n += CUB_BK_FILE_UNIT;          /* volinfo, pre-data */
+    build_fs (s + n, 8192, 0);   n += CUB_BK_FILE_UNIT;          /* data volume */
+    n += build_none_page (s + n, 0, 4096);                       /* data page pageid 0 */
+    n += build_none_page (s + n, 1, 4096);                       /* data page pageid 1 */
+    n += build_none_page (s + n, CUB_BK_FILE_END_PAGE_ID, 4096); /* FILE_END(-5): must stride */
+    build_fs (s + n, 4096, -20); n += CUB_BK_FILE_UNIT;          /* archive = boundary */
+    run_scenario (h, s, n, "N1 NONE full->archive", 1, 0);
+
+    /* N2: NONE pre-data negatives + data + FILE_END, NO trailing neg-volid -> must NOT flip */
+    n = 0;
+    build_gh (s + n, CUB_BK_HDR_VERSION, CUB_BK_ZIP_NONE, 4096); n += CUB_BK_HEADER_IO_SIZE;
+    build_fs (s + n, 32, -6);    n += CUB_BK_FILE_UNIT;          /* tde, pre-data */
+    build_fs (s + n, 4096, -5);  n += CUB_BK_FILE_UNIT;          /* volinfo, pre-data */
+    build_fs (s + n, 8192, 0);   n += CUB_BK_FILE_UNIT;          /* data volume */
+    n += build_none_page (s + n, 0, 4096);
+    n += build_none_page (s + n, CUB_BK_FILE_END_PAGE_ID, 4096);
+    run_scenario (h, s, n, "N2 NONE pre-data-neg only", 0, 0);
+
+    /* N3: NONE boundary = log-info(-4) with no archive present */
+    n = 0;
+    build_gh (s + n, CUB_BK_HDR_VERSION, CUB_BK_ZIP_NONE, 4096); n += CUB_BK_HEADER_IO_SIZE;
+    build_fs (s + n, 8192, 0);   n += CUB_BK_FILE_UNIT;          /* data */
+    n += build_none_page (s + n, 0, 4096);
+    build_fs (s + n, 4096, -4);  n += CUB_BK_FILE_UNIT;          /* log info = boundary */
+    run_scenario (h, s, n, "N3 NONE boundary=info(-4)", 1, 0);
+
+    printf ("== T14: multiple data volumes before the boundary ==\n");
+
+    /* S10: gh -> volinfo(-5) -> data(0) -> data(1) -> data(2) -> zip -> archive(-20).
+     * Several positive volids in a row: boundary must latch at the archive (after
+     * the LAST data volume), exercising the saw_data_volume re-assert + FS-unit
+     * skip path that the single-data-volume scenarios never hit. */
+    n = 0;
+    build_gh (s + n, CUB_BK_HDR_VERSION, CUB_BK_ZIP_LZ4, 16384); n += CUB_BK_HEADER_IO_SIZE;
+    build_fs (s + n, 4096, -5);  n += CUB_BK_FILE_UNIT;   /* volinfo, pre-data */
+    build_fs (s + n, 8192, 0);   n += CUB_BK_FILE_UNIT;   /* data volume 0 */
+    build_fs (s + n, 8192, 1);   n += CUB_BK_FILE_UNIT;   /* data volume 1 */
+    build_fs (s + n, 8192, 2);   n += CUB_BK_FILE_UNIT;   /* data volume 2 */
+    n += build_zip (s + n, 500);
+    build_fs (s + n, 4096, -20); n += CUB_BK_FILE_UNIT;   /* archive = boundary */
+    run_scenario (h, s, n, "S10 multi-data-vol->archive", 1, 0);
+
+    /* S11: positive volids interleaved with compressed pages, non-contiguous ids,
+     * then boundary. Must NOT arm early on any of the positive volids. */
+    n = 0;
+    build_gh (s + n, CUB_BK_HDR_VERSION, CUB_BK_ZIP_LZ4, 16384); n += CUB_BK_HEADER_IO_SIZE;
+    build_fs (s + n, 8192, 0);   n += CUB_BK_FILE_UNIT;
+    n += build_zip (s + n, 300);
+    build_fs (s + n, 8192, 1);   n += CUB_BK_FILE_UNIT;
+    n += build_zip (s + n, 400);
+    build_fs (s + n, 8192, 5);   n += CUB_BK_FILE_UNIT;   /* non-contiguous volid */
+    build_fs (s + n, 4096, -20); n += CUB_BK_FILE_UNIT;   /* boundary after last data vol */
+    run_scenario (h, s, n, "S11 interleaved multi-vol->archive", 1, 0);
+
+    /* N4: NONE mode, multiple data volumes + data pages, then archive boundary. */
+    n = 0;
+    build_gh (s + n, CUB_BK_HDR_VERSION, CUB_BK_ZIP_NONE, 4096); n += CUB_BK_HEADER_IO_SIZE;
+    build_fs (s + n, 4096, -5);  n += CUB_BK_FILE_UNIT;   /* volinfo, pre-data */
+    build_fs (s + n, 8192, 0);   n += CUB_BK_FILE_UNIT;   /* data volume 0 */
+    build_fs (s + n, 8192, 1);   n += CUB_BK_FILE_UNIT;   /* data volume 1 */
+    n += build_none_page (s + n, 0, 4096);
+    n += build_none_page (s + n, 1, 4096);
+    build_fs (s + n, 4096, -20); n += CUB_BK_FILE_UNIT;   /* archive = boundary */
+    run_scenario (h, s, n, "N4 NONE multi-data-vol->archive", 1, 0);
 
     printf ("== T11: mem_ring_put/pop wrap fuzz ==\n");
     CHECK (test_mem_ring (h), "mem_ring wrap: 50000 bytes byte-exact FIFO across wraps");
