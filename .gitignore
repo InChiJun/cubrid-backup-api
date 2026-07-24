@@ -1,0 +1,55 @@
+# ============================================================
+#  cubrid-backup-api — git ignore rules
+# ============================================================
+
+# --- Tool/agent operational state (oh-my-claudecode) ---
+.omc/
+
+# --- Node (omc CLI) crash core dumps ---
+core.node.*
+core.[0-9]*
+
+# --- Out-of-source build output ---
+build/
+build_manual/
+
+# --- Compiled objects ---
+*.o
+*.a
+*.so
+
+# --- Stray runtime / error logs ---
+csql.err
+*.log
+
+# --- testcases: binaries built from the tracked *.c sources ---
+testcases/backup_tc01
+testcases/backup_tc02
+testcases/backup_tc03
+testcases/backup_tc04
+testcases/backup_tc05
+testcases/restore_tc01
+testcases/restore_tc02
+testcases/restore_tc03
+testcases/parser_ut
+
+# --- testcases: throwaway experimental cases (sources + binaries, untracked) ---
+testcases/backup_tc_*
+
+# --- testcases: backup/restore output data (keep the dirs) ---
+testcases/backup_dir/*
+testcases/restore_dir/*
+!testcases/backup_dir/.gitignore
+!testcases/restore_dir/.gitignore
+
+# --- testcases: in-source CMake output (from `cmake .` in run_test.sh) ---
+testcases/CMakeCache.txt
+testcases/CMakeFiles/
+testcases/cmake_install.cmake
+testcases/Makefile
+
+# --- testcases: package / results / scratch produced by run_test.sh ---
+testcases/cubrid-backup-api-*.tar.gz
+testcases/cubrid-backup-api/
+testcases/*_result
+testcases/spool/
