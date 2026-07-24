@@ -20,7 +20,10 @@ else()
     message(FATAL_ERROR "Failed to parse a version string from ${VERSION_FILE} file")
 endif()
 
-set(CMAKE_C_COMPILER "gcc")
+# Do NOT hardcode CMAKE_C_COMPILER here. Being set after project(), it left a
+# stale CMAKE_C_COMPILER_ARG1 under a ccache compiler masquerade (gcc -> ccache),
+# which generated a broken "gcc gcc" compile command. Let CMake detect the
+# compiler; override with -DCMAKE_C_COMPILER=... or the CC env var when needed.
 
 if(CMAKE_BUILD_TYPE MATCHES "Debug")
     add_compile_options(-g -Wall)
