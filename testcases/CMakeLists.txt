@@ -3,7 +3,9 @@ cmake_minimum_required(VERSION 2.8)
 
 project(cubrid-backup-api-testcases)
 
-set(CMAKE_C_COMPILER gcc)
+# Do NOT hardcode CMAKE_C_COMPILER here (see src/CMakeLists.txt): after project()
+# it leaves a stale CMAKE_C_COMPILER_ARG1 under a ccache masquerade (gcc -> ccache),
+# producing a broken "gcc gcc" command. Let CMake detect the compiler.
 #add_compile_options(-g -Wall)
 
 set(CUBRID_BACKUP_API_LIB "libcubridbackupapi.so")
