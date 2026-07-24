@@ -115,7 +115,13 @@ int open_log_file (void)
 {
     char log_file_path[PATH_MAX];
 
-    snprintf (log_file_path, PATH_MAX, "%s/log/cubrid_backup.log", getenv ("CUBRID"));
+    const char *cubrid_env = getenv ("CUBRID");
+    if (cubrid_env == NULL)
+    {
+        goto error;
+    }
+
+    snprintf (log_file_path, PATH_MAX, "%s/log/cubrid_backup.log", cubrid_env);
 
     backup_mgr->log_fp = fopen (log_file_path, "a");
     if (backup_mgr->log_fp == NULL)
@@ -279,12 +285,16 @@ int make_backup_home (void)
     else
     {
         /* (2) $CUBRID_TMP */
-        snprintf (backup_path, PATH_MAX, "%s", getenv ("CUBRID_TMP"));
+        const char *cubrid_tmp = getenv ("CUBRID_TMP");
 
-        remove_trailing_slash (backup_path);
+        if (cubrid_tmp != NULL)
+        {
+            snprintf (backup_path, PATH_MAX, "%s", cubrid_tmp);
+            remove_trailing_slash (backup_path);
+        }
 
-        // 여기서 체크 후 error log 남을 수 있지만 버그 아니다.
-        if (IS_SUCCESS (validate_dir (backup_path)))
+        // A check here may emit an error log, but that is not a bug.
+        if (cubrid_tmp != NULL && IS_SUCCESS (validate_dir (backup_path)))
         {
 
         }

@@ -838,14 +838,27 @@ int check_backup_process_status (BACKUP_HANDLE* backup_handle, pid_t backup_pid)
         //if (-1 == ret)
         if (-1 == sigtimedwait (&sa_mask, NULL, &wait_timeout))
         {
-            /* timeout */
+            /* EINTR: interrupted by an unrelated caught signal (only SIGCHLD is in
+             * the wait set) — this is NOT a timeout and NOT a cancel. Keep waiting.
+             * Treating it as cancel would kill backupdb mid-stream while the caller
+             * is still told the backup SUCCEEDED, producing a silently truncated
+             * backup image. */
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+            /* timeout with no pending cancel: keep waiting */
             if (errno == EAGAIN && backup_handle->is_cancel != true)
             {
                 continue;
             }
 
-            //printf ("must hit here 4\n");
+            /* genuine cancel (is_cancel), or a hard sigtimedwait error: stop the
+             * backup process group and reap the child so it does not linger as a
+             * zombie for the lifetime of the host process. */
             kill_process_group (getpgid (backup_pid));
+            waitpid (backup_pid, &status, 0);
 
             break;
         }
@@ -942,7 +955,13 @@ void* execute_backup (void* handle)
         if (IS_FAILURE (execute_cubrid_backupdb (backup_handle)))
         {
             PRINT_LOG_ERR (ERR_INFO);
-            goto error;
+            /* Child: must NOT fall through to pthread_exit below. On the last
+             * thread pthread_exit terminates the process with status 0, which the
+             * parent would misread as a successful backup (silent server hang or a
+             * truncated image reported as SUCCESS). _exit(1) skips atexit handlers
+             * and drives the parent into its error path (buf_mark_error +
+             * cancel_efd), which wakes the drain/reader and surfaces FAILURE. */
+            _exit (1);
         }
     }
     else /* parent process */
@@ -979,8 +998,15 @@ error:
      * not_empty — neither can observe this failure. Mark the buffer failed
      * (wakes the reader) and poke cancel_efd (wakes the drain) so the API
      * surfaces FAILURE instead of hanging. Parent thread only (not the fork
-     * child: post-fork locks are unsafe there). */
-    if (backup_handle != NULL && backup_pid != 0 && backup_handle->buffering_enabled)
+     * child: post-fork locks are unsafe there).
+     *
+     * Do NOT gate this on buffering_enabled: begin_backup sets that flag only
+     * AFTER the (possibly slow) spool setup, so an early child failure reaches
+     * here while it is still false. Gating caused a permanent hang (reader parked
+     * on not_empty, drain on poll(), neither ever woken). The wakeup is safe
+     * regardless of buffering: buf_lock/not_empty are initialized for the whole
+     * handle lifetime, and the cancel_efd write is guarded by != -1. */
+    if (backup_handle != NULL && backup_pid != 0)
     {
         buf_mark_error (backup_handle);
 
@@ -2014,8 +2040,6 @@ int begin_backup (CUBRID_BACKUP_INFO* backup_info, void** handle)
         goto error;
     }
 
-    state = 2;
-
     set_thread_state (BACKUP_HANDLE_TYPE, backup_handle, THREAD_STATE_RUNNING);
 
     if (IS_FAILURE (pthread_create (&backup_handle->backup_thread, NULL, execute_backup, (void *)backup_handle)))
@@ -2025,6 +2049,12 @@ int begin_backup (CUBRID_BACKUP_INFO* backup_info, void** handle)
         PRINT_LOG_ERR (ERR_INFO);
         goto error;
     }
+
+    /* Set state = 2 only AFTER pthread_create succeeds. If it were set earlier, a
+     * create failure would run the error switch's `case 2`, which joins an
+     * uninitialized backup_thread (UB). With state still 1, the error path runs
+     * `case 1` (free_handle) only. */
+    state = 2;
 
     /* ── tiered buffer setup (best-effort: on any failure degrade to the legacy
      * direct-FIFO read path via buffering_enabled=false — never fail begin) ── */
@@ -2250,13 +2280,11 @@ int end_backup (BACKUP_HANDLE* backup_handle)
         PRINT_LOG_ERR (ERR_INFO);
     }
 
+    /* free_handle is the single owner of the final unlock (it releases
+     * backup_mutex internally), mirroring end_restore. Do NOT unlock again here:
+     * free_handle already unlocked, so a second unlock is UB on a default
+     * (NORMAL) mutex. */
     if (IS_FAILURE (free_handle (BACKUP_HANDLE_TYPE, backup_handle)))
-    {
-        PRINT_LOG_ERR (ERR_INFO);
-        goto error;
-    }
-
-    if (IS_FAILURE (pthread_mutex_unlock (&backup_handle->backup_mutex)))
     {
         PRINT_LOG_ERR (ERR_INFO);
         goto error;
