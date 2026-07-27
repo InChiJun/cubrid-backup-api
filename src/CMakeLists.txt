@@ -20,13 +20,22 @@ else()
     message(FATAL_ERROR "Failed to parse a version string from ${VERSION_FILE} file")
 endif()
 
-set(CMAKE_C_COMPILER "gcc")
+# Do NOT hardcode CMAKE_C_COMPILER here. Being set after project(), it left a
+# stale CMAKE_C_COMPILER_ARG1 under a ccache compiler masquerade (gcc -> ccache),
+# which generated a broken "gcc gcc" compile command. Let CMake detect the
+# compiler; override with -DCMAKE_C_COMPILER=... or the CC env var when needed.
 
 if(CMAKE_BUILD_TYPE MATCHES "Debug")
     add_compile_options(-g -Wall)
 endif()
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
+
+# tiered buffer: drain thread (pthread) + Linux/glibc syscalls
+# (F_SETPIPE_SZ, fallocate, eventfd) require _GNU_SOURCE.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+add_compile_definitions(_GNU_SOURCE)
 
 set(CUBRID_BACKUP_API_SRCS
     ${CMAKE_SOURCE_DIR}/backup_api.c
@@ -38,7 +47,15 @@ add_library(${PROJECT_NAME} SHARED ${CUBRID_BACKUP_API_SRCS})
 set_target_properties(${PROJECT_NAME}
                       PROPERTIES
                           SOVERSION "${CUBRID_BACKUP_API_MAJOR_VER}.${CUBRID_BACKUP_API_MINOR_VER}"
-                          PUBLIC_HEADER "${CMAKE_SOURCE_DIR}/include/backup_api.h")
+                          PUBLIC_HEADER "${CMAKE_SOURCE_DIR}/include/backup_api.h"
+                          # C11 required: the vendored backup-format header pins the
+                          # on-wire layout with _Static_assert (ABI-drift firewall).
+                          C_STANDARD 11
+                          C_STANDARD_REQUIRED ON)
+
+# The library itself now spawns the drain thread, so link pthread explicitly
+# instead of relying on the loading executable to pull it in.
+target_link_libraries(${PROJECT_NAME} PRIVATE Threads::Threads)
 
 install(TARGETS ${PROJECT_NAME}
         LIBRARY

@@ -6,6 +6,19 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+
+/* F_SETPIPE_SZ / F_GETPIPE_SZ were added in Linux 2.6.35 and are absent from
+   the CUBRID build image (CentOS 6.10, glibc 2.12, kernel-headers 2.6.32), so
+   building there fails with "undeclared". They are ABI-stable kernel constants
+   (F_LINUX_SPECIFIC_BASE 1024 + 7/8) and the syscall works at runtime on any
+   kernel >= 2.6.35, so define them only when the platform headers omit them. */
+#ifndef F_SETPIPE_SZ
+#define F_SETPIPE_SZ 1031
+#endif
+#ifndef F_GETPIPE_SZ
+#define F_GETPIPE_SZ 1032
+#endif
+
 #include <dlfcn.h>
 #include "backup_common.h"
 
@@ -15,6 +28,8 @@
     print_log ("INFO:", __VA_ARGS__)
 #define PRINT_LOG_ERR(...) \
     print_log ("ERROR:", __VA_ARGS__)
+#define PRINT_LOG_WARN(...) \
+    print_log ("WARNING:", __VA_ARGS__)
 
 typedef struct backup_option BACKUP_OPTION;
 struct backup_option
@@ -26,6 +41,12 @@ struct backup_option
     bool compress;
     bool except_active_log;
     int sleep_msecs;
+
+    int       fifo_size;              /* bytes, default 64KB, clamped <= 1MB */
+    long long buffer_memory_size;     /* bytes, 0 = buffering disabled       */
+    long long buffer_disk_limit;      /* bytes, 0 = no disk tier             */
+    char      buffer_disk_path[PATH_MAX];
+    bool      buffer_disk_keep_spool; /* default false = unlink-on-open      */
 };
 
 typedef struct restore_option RESTORE_OPTION;

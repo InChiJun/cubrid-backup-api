@@ -5,9 +5,15 @@
 #include <sys/timeb.h>
 #include <errno.h>
 #include <assert.h>
+#include <pthread.h>
+#include <sys/statvfs.h>
 #include "backup_manager.h"
 
 #define INT_MAX 2147483647
+
+#ifndef LLONG_MAX
+#define LLONG_MAX 9223372036854775807LL
+#endif
 
 #define LOG_HEADER_MAX_SIZE  (50)
 #define LOG_MESSAGE_MAX_SIZE (LOG_HEADER_MAX_SIZE + 1024)
@@ -15,6 +21,19 @@
 BACKUP_MANAGER backup_manager;
 
 BACKUP_MANAGER* backup_mgr = &backup_manager;
+
+/* print_log() serializes on this leaf lock: once the drain thread also logs,
+ * the static log_buffer and the append to log_fp are shared state. */
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* fork-safety: the backup child forked in execute_backup runs briefly before
+ * execv and may call print_log, which takes log_mutex. If another thread (e.g. the
+ * drain) held log_mutex at the instant of fork, the child would inherit it locked
+ * and self-deadlock. These pthread_atfork handlers acquire it around fork so the
+ * child inherits a consistent mutex and then unlocks it. */
+static void log_atfork_prepare (void) { pthread_mutex_lock (&log_mutex); }
+static void log_atfork_parent  (void) { pthread_mutex_unlock (&log_mutex); }
+static void log_atfork_child   (void) { pthread_mutex_unlock (&log_mutex); }
 
 static
 int make_log_header (char* buf, size_t buf_len, const char *prefix_str)
@@ -62,6 +81,8 @@ int print_log (const char *prefix_str, const char *msg, ...)
         return SUCCESS;
     }
 
+    pthread_mutex_lock (&log_mutex);
+
     p = log_buffer;
     len = LOG_MESSAGE_MAX_SIZE;
     n = make_log_header (p, len, prefix_str);
@@ -79,8 +100,12 @@ int print_log (const char *prefix_str, const char *msg, ...)
         va_end (arg_list);
     }
 
-    fprintf (backup_mgr->log_fp, log_buffer);
+    /* "%s": log_buffer is data, not a format string — conf-supplied values
+     * (e.g. buffer_disk_path) may contain '%'. */
+    fprintf (backup_mgr->log_fp, "%s", log_buffer);
     fflush (backup_mgr->log_fp);
+
+    pthread_mutex_unlock (&log_mutex);
 
     return SUCCESS;
 }
@@ -90,7 +115,13 @@ int open_log_file (void)
 {
     char log_file_path[PATH_MAX];
 
-    snprintf (log_file_path, PATH_MAX, "%s/log/cubrid_backup.log", getenv ("CUBRID"));
+    const char *cubrid_env = getenv ("CUBRID");
+    if (cubrid_env == NULL)
+    {
+        goto error;
+    }
+
+    snprintf (log_file_path, PATH_MAX, "%s/log/cubrid_backup.log", cubrid_env);
 
     backup_mgr->log_fp = fopen (log_file_path, "a");
     if (backup_mgr->log_fp == NULL)
@@ -246,7 +277,7 @@ int make_backup_home (void)
     /* (1) $CUBRID/tmp */
     snprintf (backup_path, PATH_MAX, "%s/tmp", backup_mgr->cubrid_home);
 
-    // 여기서 체크 후 error log 남을 수 있지만 버그 아니다.
+    // A check here may emit an error log, but that is not a bug.
     if (IS_SUCCESS (validate_dir (backup_path)))
     {
 
@@ -254,12 +285,16 @@ int make_backup_home (void)
     else
     {
         /* (2) $CUBRID_TMP */
-        snprintf (backup_path, PATH_MAX, "%s", getenv ("CUBRID_TMP"));
+        const char *cubrid_tmp = getenv ("CUBRID_TMP");
 
-        remove_trailing_slash (backup_path);
+        if (cubrid_tmp != NULL)
+        {
+            snprintf (backup_path, PATH_MAX, "%s", cubrid_tmp);
+            remove_trailing_slash (backup_path);
+        }
 
-        // 여기서 체크 후 error log 남을 수 있지만 버그 아니다.
-        if (IS_SUCCESS (validate_dir (backup_path)))
+        // A check here may emit an error log, but that is not a bug.
+        if (cubrid_tmp != NULL && IS_SUCCESS (validate_dir (backup_path)))
         {
 
         }
@@ -360,7 +395,13 @@ int init_default_backup_option (void)
     backup_opt->compress           = false; /* [M] */
     backup_opt->except_active_log  = false; /* [M] */
     backup_opt->sleep_msecs        = 0;     /* [M] */
- 
+
+    backup_opt->fifo_size              = 64 * 1024;          /* 64KB               */
+    backup_opt->buffer_memory_size     = 0;                  /* buffering OFF (opt-in): set >0 to enable the drain/tiered-buffer path */
+    backup_opt->buffer_disk_limit      = 0;                  /* disk tier off      */
+    backup_opt->buffer_disk_path[0]    = '\0';
+    backup_opt->buffer_disk_keep_spool = false;
+
     return SUCCESS;
 }
 
@@ -448,9 +489,81 @@ error:
 }
 
 static
+int set_size_value (long long* dest, char* src)
+{
+    char* endp;
+    long long val, factor = 1;
+
+    errno = 0;
+    val = strtoll (src, &endp, 10);
+
+    if (errno == ERANGE || val < 0)
+    {
+        PRINT_LOG_ERR (ERR_INFO);
+        goto error;
+    }
+
+    /* optional binary (1024-based) size suffix */
+    if (*endp != '\0')
+    {
+        if (IS_ZERO (strncasecmp (endp, "KB", 3)))
+        {
+            factor = 1024LL;
+        }
+        else if (IS_ZERO (strncasecmp (endp, "MB", 3)))
+        {
+            factor = 1024LL * 1024;
+        }
+        else if (IS_ZERO (strncasecmp (endp, "GB", 3)))
+        {
+            factor = 1024LL * 1024 * 1024;
+        }
+        else
+        {
+            PRINT_LOG_ERR (ERR_INFO);
+            goto error;
+        }
+    }
+
+    if (val > LLONG_MAX / factor)   /* suffix-multiply overflow guard */
+    {
+        PRINT_LOG_ERR (ERR_INFO);
+        goto error;
+    }
+
+    *dest = val * factor;
+
+    return SUCCESS;
+
+error:
+
+    return FAILURE;
+}
+
+static
+int set_path_value (char* dest, size_t dest_size, char* src)
+{
+    if (strlen (src) >= dest_size)
+    {
+        PRINT_LOG_ERR (ERR_INFO);
+        goto error;
+    }
+
+    snprintf (dest, dest_size, "%s", src);
+
+    return SUCCESS;
+
+error:
+
+    return FAILURE;
+}
+
+static
 int set_backup_option (char* key, char* value)
 {
     BACKUP_OPTION* backup_opt;
+
+    long long sz;
 
     backup_opt = &backup_mgr->default_backup_option;
 
@@ -510,6 +623,48 @@ int set_backup_option (char* key, char* value)
             goto error;
         }
     }
+    else if (IS_ZERO (strncasecmp (key, "fifo_size", 10)))
+    {
+        if (IS_FAILURE (set_size_value (&sz, value)) || sz > INT_MAX)
+        {
+            PRINT_LOG_ERR (ERR_INFO);
+            goto error;
+        }
+
+        backup_opt->fifo_size = (int) sz;
+    }
+    else if (IS_ZERO (strncasecmp (key, "buffer_memory_size", 19)))
+    {
+        if (IS_FAILURE (set_size_value (&backup_opt->buffer_memory_size, value)))
+        {
+            PRINT_LOG_ERR (ERR_INFO);
+            goto error;
+        }
+    }
+    else if (IS_ZERO (strncasecmp (key, "buffer_disk_limit", 18)))
+    {
+        if (IS_FAILURE (set_size_value (&backup_opt->buffer_disk_limit, value)))
+        {
+            PRINT_LOG_ERR (ERR_INFO);
+            goto error;
+        }
+    }
+    else if (IS_ZERO (strncasecmp (key, "buffer_disk_path", 17)))
+    {
+        if (IS_FAILURE (set_path_value (backup_opt->buffer_disk_path, PATH_MAX, value)))
+        {
+            PRINT_LOG_ERR (ERR_INFO);
+            goto error;
+        }
+    }
+    else if (IS_ZERO (strncasecmp (key, "buffer_disk_keep_spool", 23)))
+    {
+        if (IS_FAILURE (set_bool_value (&backup_opt->buffer_disk_keep_spool, value)))
+        {
+            PRINT_LOG_ERR (ERR_INFO);
+            goto error;
+        }
+    }
     else
     {
         PRINT_LOG_ERR (ERR_INFO);
@@ -563,7 +718,7 @@ static
 int compile_regex (regex_t* re_opt_header, regex_t* re_opt, regex_t* re_empty_line)
 {
     char* regex_header     = "^[[:blank:]]*\\[[[:blank:]]*(backup|restore)[[:blank:]]*\\][[:space:]]*$";
-    char* regex_key_value  = "^[[:blank:]]*([_[:alpha:]]+)[[:blank:]]*=[[:blank:]]*([[:alnum:]]+)[[:space:]]*$";
+    char* regex_key_value  = "^[[:blank:]]*([_[:alpha:]]+)[[:blank:]]*=[[:blank:]]*([[:alnum:]/._-]+)[[:space:]]*$";
     char* regex_empty_line = "^[[:space:]]*$";
 
     if (IS_FAILURE (regcomp (re_opt_header, regex_header, REG_ICASE | REG_EXTENDED)))
@@ -782,8 +937,80 @@ error:
     return FAILURE;
 }
 
+static
+int validate_backup_option (void)
+{
+    BACKUP_OPTION* backup_opt;
+
+    backup_opt = &backup_mgr->default_backup_option;
+
+    /* fifo_size: clamp to [64KB, 1MB] (Linux default pipe-max-size). Non-fatal. */
+    if (backup_opt->fifo_size < 64 * 1024)
+    {
+        PRINT_LOG_WARN ("fifo_size below 64KB; raising to 64KB\n");
+        backup_opt->fifo_size = 64 * 1024;
+    }
+
+    if (backup_opt->fifo_size > 1024 * 1024)
+    {
+        PRINT_LOG_WARN ("fifo_size above 1MB; clamping to 1MB\n");
+        backup_opt->fifo_size = 1024 * 1024;
+    }
+
+    /* memory tier must hold at least one io_size chunk when enabled */
+    if (backup_opt->buffer_memory_size != 0 &&
+        backup_opt->buffer_memory_size < backup_mgr->io_size)
+    {
+        PRINT_LOG_ERR (ERR_INFO);
+        goto error;
+    }
+
+    /* disk tier is an overflow of the memory tier and needs a valid spool dir */
+    if (backup_opt->buffer_disk_limit > 0)
+    {
+        struct statvfs vfs;
+
+        if (backup_opt->buffer_memory_size == 0)
+        {
+            PRINT_LOG_ERR (ERR_INFO);
+            goto error;
+        }
+
+        if (IS_FAILURE (validate_dir (backup_opt->buffer_disk_path)))
+        {
+            PRINT_LOG_ERR (ERR_INFO);
+            goto error;
+        }
+
+        /* free-space shortfall is a warning, not a failure (runtime ENOSPC degrades) */
+        if (statvfs (backup_opt->buffer_disk_path, &vfs) == 0)
+        {
+            long long avail = (long long) vfs.f_bavail * (long long) vfs.f_frsize;
+
+            if (avail < backup_opt->buffer_disk_limit)
+            {
+                PRINT_LOG_WARN ("spool free space is below buffer_disk_limit\n");
+            }
+        }
+    }
+
+    return SUCCESS;
+
+error:
+
+    return FAILURE;
+}
+
 int start_backup_manager (void)
 {
+    static bool atfork_registered = false;
+
+    if (!atfork_registered)                 /* register once per process, before any backup fork */
+    {
+        (void) pthread_atfork (log_atfork_prepare, log_atfork_parent, log_atfork_child);
+        atfork_registered = true;
+    }
+
     if (IS_FAILURE (open_log_file ()))
     {
         //PRINT_LOG_ERR (ERR_INFO);
@@ -809,6 +1036,12 @@ int start_backup_manager (void)
     }
 
     if (IS_FAILURE (set_io_size ()))
+    {
+        PRINT_LOG_ERR (ERR_INFO);
+        goto error;
+    }
+
+    if (IS_FAILURE (validate_backup_option ()))
     {
         PRINT_LOG_ERR (ERR_INFO);
         goto error;

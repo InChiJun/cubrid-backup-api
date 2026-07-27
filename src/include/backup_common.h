@@ -3,7 +3,7 @@
 
 #include <unistd.h>
 
-#define SUCCESS_FRAGMENTED (1) // cubrid_backup_read () 시 읽을 데이터가 남아 있음을 의미
+#define SUCCESS_FRAGMENTED (1) // means there is still data left to read on cubrid_backup_read ()
 #define SUCCESS            (0)
 #define FAILURE            (-1)
 

@@ -1,4 +1,7 @@
 #include <errno.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <stdint.h>
 #include "handle_manager.h"
 
 HANDLE_MANAGER handle_manager;
@@ -20,6 +23,36 @@ int initialize_handle_manager (void)
         goto error;
     }
 
+    /* Seed fd sentinels to -1 BEFORE any fallible init below: the static handle
+     * is zero-initialized, so if an init fails (goto error -> finalize) the fd
+     * fields must already be -1, else finalize would close() fd 0. */
+    handle_mgr->backup_handle.fifo_fd       = -1;
+    handle_mgr->backup_handle.disk_fd       = -1;
+    handle_mgr->backup_handle.cancel_efd    = -1;
+    handle_mgr->backup_handle.mem_buf       = NULL;
+    handle_mgr->backup_handle.drain_started = false;
+    handle_mgr->restore_handle.restore_fd   = -1;
+
+    /* tiered-buffer sync objects: init once per process (the handle is reused
+     * across begin/end, so these must NOT be re-init'd per backup). */
+    if (IS_FAILURE (pthread_mutex_init (&handle_mgr->backup_handle.buf_lock, NULL)))
+    {
+        PRINT_LOG_ERR (ERR_INFO);
+        goto error;
+    }
+
+    if (IS_FAILURE (pthread_cond_init (&handle_mgr->backup_handle.not_empty, NULL)))
+    {
+        PRINT_LOG_ERR (ERR_INFO);
+        goto error;
+    }
+
+    if (IS_FAILURE (pthread_cond_init (&handle_mgr->backup_handle.not_full, NULL)))
+    {
+        PRINT_LOG_ERR (ERR_INFO);
+        goto error;
+    }
+
     return SUCCESS;
 
 error:
@@ -34,6 +67,10 @@ int finalize_handle_manager (void)
 
     pthread_mutex_destroy (&handle_mgr->restore_handle.restore_mutex);
 
+    pthread_cond_destroy (&handle_mgr->backup_handle.not_full);
+    pthread_cond_destroy (&handle_mgr->backup_handle.not_empty);
+    pthread_mutex_destroy (&handle_mgr->backup_handle.buf_lock);
+
     return SUCCESS;
 }
 
@@ -41,6 +78,8 @@ static
 int initialize_backup_handle (BACKUP_HANDLE* backup_handle)
 {
     backup_handle->backup_thread_state = THREAD_STATE_NO_SPAWN;
+
+    backup_handle->backup_thread_started = false;
 
     backup_handle->is_cancel = false;
 
@@ -55,34 +94,128 @@ int initialize_backup_handle (BACKUP_HANDLE* backup_handle)
 
     backup_handle->db_name[0] = '\0';
 
+    /* ── tiered buffer: reset only (handle is reused; never malloc/open here) ── */
+    backup_handle->buffering_enabled = false;
+    backup_handle->drain_started     = false;
+    backup_handle->stop              = false;
+    backup_handle->cancel_efd        = -1;
+
+    backup_handle->mem_buf  = NULL;
+    backup_handle->mem_cap  = 0;
+    backup_handle->mem_len  = 0;
+    backup_handle->mem_head = 0;
+    backup_handle->mem_tail = 0;
+
+    backup_handle->disk_fd   = -1;
+    backup_handle->disk_cap  = 0;
+    backup_handle->disk_len  = 0;
+    backup_handle->disk_head = 0;
+    backup_handle->disk_tail = 0;
+
+    backup_handle->producer_eof = false;
+    backup_handle->buf_error    = false;
+
+    backup_handle->mem_high_water  = 0;
+    backup_handle->disk_high_water = 0;
+    backup_handle->spilled         = false;
+    backup_handle->wait_count      = 0;
+    backup_handle->wait_us_total   = 0;
+    backup_handle->bytes_total     = 0;
+
+    /* log-phase parser: reset only (global_header is malloc'd in begin_backup,
+     * freed in finalize_backup_handle). Start disabled; begin_backup arms it. */
+    backup_handle->parser.state            = PS_DISABLED;
+    backup_handle->parser.need_bytes       = 0;
+    backup_handle->parser.got_bytes        = 0;
+    backup_handle->parser.skip_bytes       = 0;
+    backup_handle->parser.saw_data_volume  = 0;
+    backup_handle->parser.backup_page_size = 0;
+    backup_handle->parser.compressed       = 0;
+    backup_handle->parser.global_header    = NULL;
+    backup_handle->parser_on               = false;
+    backup_handle->log_phase               = false;
+    backup_handle->phase_published         = false;
+    backup_handle->lookahead_count         = 0;
+
     return SUCCESS;
 }
 
 static
 int finalize_backup_handle (BACKUP_HANDLE* backup_handle)
 {
-    if (backup_handle->backup_thread_state == THREAD_STATE_RUNNING)
+    /* Join on "was created", not on THREAD_STATE: a state-gated join is skipped
+     * on the normal path and leaks the thread. */
+    if (backup_handle->backup_thread_started)
     {
-        backup_handle->is_cancel = true;
+        if (backup_handle->backup_thread_state == THREAD_STATE_RUNNING)
+        {
+            backup_handle->is_cancel = true;
+        }
 
-        // thread 상태 변경 후 create 하기 때문에 생성 실패시 hang 발생할 수 있다.
-        // (생성 실패하였는데, 상태는 THREAD_STATE_RUNNING 이기 때문에)
-        // 상태를 먼저 변경하는 이유는
-        // cubrid_backup_finalize () 호출 시 thread 상태가 THREAD_STATE_RUNNING 로 바뀌기 전이라면,
-        // 이 부분을 pass 하고, 내부 handle을 free하기 때문에
-        // 서버에서 아래와 같은 에러가 발생한다.
+        // We create the thread after changing its state, so a creation failure can hang.
+        // (creation failed, yet the state is already THREAD_STATE_RUNNING)
+        // The reason we change the state first: if cubrid_backup_finalize () is called
+        // before the thread state becomes THREAD_STATE_RUNNING, this part is skipped and
+        // the internal handle is freed, so the server raises the error below.
         // ERROR: Destination-path does not exist or is not a directory.
         // 
-        // 이는 handle에 있던 -D (fifo) 경로를 아래 initialize_backup_handle () 함수에서
-        // 초기화하기 때문이다.
-        // 이 구조적인 문제는 다음 버전에서 개선하기로 한다.
+        // That happens because the -D (fifo) path stored in the handle is reset by the
+        // initialize_backup_handle () function below.
+        // This structural problem is left to be improved in a future version.
         pthread_join (backup_handle->backup_thread, NULL);
+        backup_handle->backup_thread_started = false;
+    }
+
+    /* tiered-buffer: wake a parked drain (cond_wait / poll) and join it BEFORE
+     * the fifo is closed (the drain reads fifo_fd). No-op until a drain is
+     * spawned. */
+    if (backup_handle->drain_started)
+    {
+        pthread_mutex_lock (&backup_handle->buf_lock);
+        backup_handle->stop      = true;
+        backup_handle->buf_error = true;
+        pthread_cond_broadcast (&backup_handle->not_empty);
+        pthread_cond_broadcast (&backup_handle->not_full);
+        pthread_mutex_unlock (&backup_handle->buf_lock);
+
+        if (backup_handle->cancel_efd != -1)
+        {
+            uint64_t one = 1;
+            (void) write (backup_handle->cancel_efd, &one, sizeof (one));
+        }
+
+        pthread_join (backup_handle->drain_thread, NULL);
+        backup_handle->drain_started = false;
     }
 
     if (backup_handle->fifo_fd != -1)
     {
         close (backup_handle->fifo_fd);
         unlink (backup_handle->fifo_path);
+    }
+
+    /* spool fd close reclaims disk space (unlink-on-open); free the mem ring.
+     * initialize_backup_handle() below resets these, keeping teardown idempotent. */
+    if (backup_handle->disk_fd != -1)
+    {
+        close (backup_handle->disk_fd);
+    }
+
+    if (backup_handle->cancel_efd != -1)
+    {
+        close (backup_handle->cancel_efd);
+    }
+
+    if (backup_handle->mem_buf != NULL)
+    {
+        free (backup_handle->mem_buf);
+    }
+
+    /* free the parser's header-accumulation buffer (malloc'd in begin_backup) */
+    if (backup_handle->parser.global_header != NULL)
+    {
+        free (backup_handle->parser.global_header);
+        backup_handle->parser.global_header = NULL;
     }
 
     initialize_backup_handle (backup_handle);

@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include "backup_manager.h"
+#include "cubrid_backup_format.h"
 
 /* The maximum length of database name is 17 in English. */
 /* For database name + @ + host name */
@@ -39,7 +40,11 @@ struct backup_handle
     pthread_t backup_thread;
     pthread_mutex_t backup_mutex;
 
-    THREAD_STATE backup_thread_state;
+    volatile THREAD_STATE backup_thread_state;   /* read by drain for EOF classification */
+
+    /* backup_thread join guard: the thread publishes its terminal state before
+     * it finishes, so THREAD_STATE cannot tell whether a join is still owed. */
+    bool backup_thread_started;
 
     bool is_cancel;
 
@@ -53,6 +58,51 @@ struct backup_handle
     char fifo_path[PATH_MAX];
 
     char db_name[MAX_DB_NAME_LEN];
+
+    /* ── tiered buffer ── */
+    bool buffering_enabled;   /* true when mem_buf alloc succeeds; false = legacy direct-FIFO path */
+    bool drain_started;       /* drain_thread join guard (THREAD_STATE is for backup_thread only) */
+    volatile bool stop;       /* unified stop signal (cancel/error/eof); read lock-free in drain */
+    int  cancel_efd;          /* eventfd: wakes drain immediately during poll; -1 = unused */
+
+    char*  mem_buf;           /* malloc(mem_cap), memory ring; NULL = not allocated */
+    size_t mem_cap;
+    size_t mem_len;
+    size_t mem_head;
+    size_t mem_tail;
+
+    int       disk_fd;        /* spool file (Phase 2); -1 = unused */
+    long long disk_cap;
+    long long disk_len;
+    long long disk_head;
+    long long disk_tail;
+
+    bool producer_eof;        /* drain: FIFO reached normal EOF */
+    bool buf_error;           /* buffered path error/cancel */
+
+    pthread_t       drain_thread;
+    pthread_mutex_t buf_lock;
+    pthread_cond_t  not_empty;
+    pthread_cond_t  not_full;
+
+    /* observability */
+    size_t        mem_high_water;
+    long long     disk_high_water;
+    bool          spilled;
+    unsigned long wait_count;
+    long long     wait_us_total;
+    long long     bytes_total;
+
+    /* ── observational log-phase parser (drain-thread-private) ──
+     * parser_on / log_phase are written and read only by the drain thread
+     * (parser peeks, then use_disk consumes next iteration: same thread ⇒ no
+     * sync needed for the tier decision). phase_published mirrors log_phase under
+     * buf_lock for cross-thread observability only. */
+    BK_PARSER     parser;
+    bool          parser_on;        /* run the parser + 2-mode reserved-spool policy */
+    bool          log_phase;        /* log-copy phase reached; reserved spool armed   */
+    bool          phase_published;  /* observability mirror of log_phase (buf_lock)   */
+    unsigned long lookahead_count;  /* # of data-phase probe reads performed          */
 };
 
 typedef struct restore_handle RESTORE_HANDLE;
