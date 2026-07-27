@@ -115,13 +115,22 @@ R "5. modify set B (different 10% + deletes) -> LEVEL 2"
 do_level 2
 
 R "6. restore each level (volumes+logs wiped => state at that backup)"
+s04_live(){ timeout 5 csql -u dba -N -c "SELECT 1 FROM db_root" $DB 2>/dev/null | grep -qE '^[[:space:]]*[0-9]+'; }
+s04_wait_db(){ local _e=$((SECONDS+600)); while [ $SECONDS -lt $_e ]; do s04_live && return 0; sleep 2; done; return 1; }
 for L in 2 1 0; do
   cubrid server stop $DB >/dev/null 2>&1
   rm -f $W/db/${DB} $W/db/${DB}_* $W/db/${DB}.* 2>/dev/null
   t0=$(date +%s)
   printf '0\n0\n0\n0\n0\n0\n' | cubrid restoredb -B $W/bk -l $L $DB > $W/restore_l$L.out 2>&1
   rrc=$?
+  # Separate "restore never ran" from "data differs"; otherwise an aborted
+  # restore is reported as a hash MISMATCH, i.e. reads as data corruption.
+  if grep -qE 'Unable to mount|Backup volume|not found|following' $W/restore_l$L.out; then
+    nok "restore -l $L ABORTED (missing volume/archive during roll-forward); see restore_l$L.out"; continue
+  fi
+  if [ "$rrc" -ne 0 ]; then nok "restore -l $L failed rc=$rrc; see restore_l$L.out"; continue; fi
   cubrid server start $DB >/dev/null 2>&1
+  s04_wait_db || { nok "restore -l $L: server not ready in 600s"; continue; }
   t1=$(date +%s)
   HR=$(dump | sha256sum | awk '{print $1}')
   if [ "$HR" = "${H[$L]}" ]; then ok "restore -l $L: hash matches expected state ($((t1-t0))s)"

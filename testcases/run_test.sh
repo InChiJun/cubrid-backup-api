@@ -4,13 +4,17 @@
 cur_path=`pwd`
 db_name='testdb'
 
+: "${CUBRID:?CUBRID must be set}"
+
 cd ..
-sh build.sh
-cp build_*/cubrid-backup-api-*.tar.gz testcases/
+sh build.sh || { echo "[NOK] build.sh failed"; exit 1; }
 cd testcases
-tar xfz cubrid-backup-api-*.tar.gz
-cmake .
-make
+# drop stale artifacts so a failed build cannot be tested by mistake
+rm -rf cubrid-backup-api cubrid-backup-api-*.tar.gz
+cp ../build_*/cubrid-backup-api-*.tar.gz . || { echo "[NOK] package missing"; exit 1; }
+tar xfz cubrid-backup-api-*.tar.gz || { echo "[NOK] untar failed"; exit 1; }
+cmake . || { echo "[NOK] cmake failed"; exit 1; }
+make  || { echo "[NOK] make failed"; exit 1; }
 
 expect_val=""
 function restoredb_exe()
@@ -65,19 +69,19 @@ echo ""
 
 echo "==run restore_tc01"
 ./restore_tc01 $db_name 0 ./backup_dir/${db_name}_bk0v000 0 ./restore_dir/ > restore_tc01_result 2>&1
-if [ -z "`cmp ./backup_dir/${db_name}_bk0v000 ./restore_dir/${db_name}_bk0v000`" ]; then
+if cmp -s ./backup_dir/${db_name}_bk0v000 ./restore_dir/${db_name}_bk0v000; then
 	echo "[OK] compare restore file of level 0" >> restore_tc01_result
 else
 	echo "[NOK] compare restore file of level 0" >> restore_tc01_result
 fi
 ./restore_tc01 $db_name 1 ./backup_dir/${db_name}_bk1v000 0 ./restore_dir/ >> restore_tc01_result 2>&1
-if [ -z "`cmp ./backup_dir/${db_name}_bk1v000 ./restore_dir/${db_name}_bk1v000`" ]; then
+if cmp -s ./backup_dir/${db_name}_bk1v000 ./restore_dir/${db_name}_bk1v000; then
 	echo "[OK] compare restore file of level 1" >> restore_tc01_result
 else
 	echo "[NOK] compare restore file of level 1" >> restore_tc01_result
 fi
 ./restore_tc01 $db_name 2 ./backup_dir/${db_name}_bk2v000 0 ./restore_dir/ >> restore_tc01_result 2>&1
-if [ -z "`cmp ./backup_dir/${db_name}_bk2v000 ./restore_dir/${db_name}_bk2v000`" ]; then
+if cmp -s ./backup_dir/${db_name}_bk2v000 ./restore_dir/${db_name}_bk2v000; then
 	echo "[OK] compare restore file of level 2" >> restore_tc01_result
 else
 	echo "[NOK] compare restore file of level 2" >> restore_tc01_result
@@ -108,7 +112,7 @@ echo ""
 echo "==run backup_tc04"
 rm -rf $CUBRID/log/cubrid_utility.log
 ./backup_tc04 $db_name 0 -1 -1 -1 -1 ./backup_dir/${db_name}_bk0v000 > backup_tc04_result 2>&1 
-if [ `grep "0 \-l 0 testdb" $CUBRID/log/cubrid_utility.log | wc -l` -eq 1 ]; then
+if [ `grep "0 \-l 0 \-\-no\-compress testdb" $CUBRID/log/cubrid_utility.log | wc -l` -eq 1 ]; then
         echo "[OK] set options" >> backup_tc04_result
 else
         echo "[NOK] set options" >> backup_tc04_result
@@ -156,7 +160,7 @@ rm -rf $CUBRID/log/cubrid_utility.log
 sleep 1
 
 ./backup_tc04 $db_name 0 1 0 0 0 ./backup_dir/${db_name}_bk0v000 >> backup_tc04_result 2>&1 
-if [ `grep "0 \-r \-l 0 testdb" $CUBRID/log/cubrid_utility.log | wc -l` -eq 1 ]; then
+if [ `grep "0 \-r \-l 0 \-\-no\-compress testdb" $CUBRID/log/cubrid_utility.log | wc -l` -eq 1 ]; then
         echo "[OK] set options" >> backup_tc04_result
 else
         echo "[NOK] set options" >> backup_tc04_result
@@ -180,7 +184,7 @@ rm -rf $CUBRID/log/cubrid_utility.log
 sleep 1
 
 ./backup_tc04 $db_name 0 0 0 1 0 ./backup_dir/${db_name}_bk0v000 >> backup_tc04_result 2>&1 
-if [ `grep "0 \-l 0 \-\-no\-check testdb" $CUBRID/log/cubrid_utility.log | wc -l` -eq 1 ]; then
+if [ `grep "0 \-l 0 \-\-no\-check \-\-no\-compress testdb" $CUBRID/log/cubrid_utility.log | wc -l` -eq 1 ]; then
         echo "[OK] set options" >> backup_tc04_result
 else
         echo "[NOK] set options" >> backup_tc04_result
@@ -280,7 +284,7 @@ if [ $tc05_rc -eq 124 ]; then
 	echo "[NOK] backup_tc05 timed out (possible slow-consumer hang)" >> backup_tc05_result
 elif grep -q "\[OK\]" backup_tc05_result; then
 	./restore_tc01 $db_name 0 ./backup_dir/${db_name}_bk0v000 0 ./restore_dir/ >> backup_tc05_result 2>&1
-	if [ -z "`cmp ./backup_dir/${db_name}_bk0v000 ./restore_dir/${db_name}_bk0v000`" ]; then
+	if cmp -s ./backup_dir/${db_name}_bk0v000 ./restore_dir/${db_name}_bk0v000; then
 		echo "[OK] backup_tc05 slow-consumer backup restores byte-identical" >> backup_tc05_result
 	else
 		echo "[NOK] backup_tc05 restore byte mismatch" >> backup_tc05_result
@@ -316,7 +320,19 @@ cubrid service stop
 cubrid deletedb $db_name
 rm -rf ${db_name}_bkvinf ./backup_dir/* ./restore_dir/* $CUBRID/log/*
 
-fail_count=`grep "\[NOK\]" *_result |wc -l`
+# verdict guards: a missing result file or a truncated run must not read as PASS
+EXPECTED_RESULTS="backup_tc01 backup_tc02 backup_tc03 backup_tc04 backup_tc05 restore_tc01 restore_tc02 restore_tc03 conf_test parser_ut"
+for e in $EXPECTED_RESULTS; do
+	if [ ! -s "${e}_result" ]; then
+		echo "[NOK] missing or empty ${e}_result" >> harness_result
+	fi
+done
+ok_total=`cat *_result 2>/dev/null | grep -c "\[OK\]"`
+if [ "$ok_total" -lt 165 ]; then
+	echo "[NOK] under-run: only $ok_total [OK] markers (expected >= 100)" >> harness_result
+fi
+
+fail_count=`grep "\[NOK\]" *_result 2>/dev/null |wc -l`
 echo ""
 echo "==================="
 if [ $fail_count -ne 0 ]; then
@@ -334,3 +350,4 @@ fi
 echo "==================="
 echo ""
 
+[ "$fail_count" -eq 0 ] || exit 1

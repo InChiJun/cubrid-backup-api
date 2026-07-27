@@ -32,7 +32,7 @@ mkdir -p $W/lib $W/hdr $W/spool $W/bk $W/db; : > $RES; cd $W/db
 
 say "=== 0. build API + clients (feature/log-phase-parser) ==="
 gcc -shared -fPIC -std=gnu11 -D_GNU_SOURCE -I $API/src/include -O2 -o $W/lib/libcubridbackupapi.so \
-  $API/src/backup_api.c $API/src/backup_core.c $API/src/backup_manager.c $API/src/handle_manager.c -lpthread || { say "API BUILD FAIL"; exit 1; }
+  $API/src/backup_api.c $API/src/backup_core.c $API/src/backup_manager.c $API/src/handle_manager.c -lpthread || { say "BUILD_FAIL"; exit 1; }
 cp $API/src/include/backup_api.h $W/hdr/cubrid_backup_api.h
 gcc -I $W/hdr -O2 -o $W/backup_tc05 $API/testcases/backup_tc05.c -L $W/lib -lcubridbackupapi || exit 1
 
@@ -46,7 +46,7 @@ setp checkpoint_every_size 1024G
 setp vacuum_disable yes
 [ -f "$CONF" ] && cp "$CONF" $W/bkconf.bak
 cubrid server stop $DB >/dev/null 2>&1; cubrid deletedb $DB >/dev/null 2>&1; rm -rf $W/db/*
-cubrid createdb -r --db-volume-size=1G --log-volume-size=512M $DB en_US >/dev/null 2>&1 || { say "CREATEDB FAIL"; cp $W/cubrid.conf.bak "$SVCONF"; exit 1; }
+cubrid createdb -r --db-volume-size=1G --log-volume-size=512M $DB en_US >/dev/null 2>&1 || { say "CREATEDB_FAIL"; cp $W/cubrid.conf.bak "$SVCONF"; exit 1; }
 cubrid server start $DB >/dev/null 2>&1 || { say "SERVER START FAIL"; cp $W/cubrid.conf.bak "$SVCONF"; exit 1; }
 
 say "=== 2. seed + generate WAL to >= $TARGET_ARCH archives (checkpoint off => all needed) ==="
@@ -140,3 +140,32 @@ cubrid server stop $DB >/dev/null 2>&1; cubrid deletedb $DB >/dev/null 2>&1; cub
 cp $W/cubrid.conf.bak "$SVCONF"; [ -f $W/bkconf.bak ] && cp $W/bkconf.bak "$CONF" || rm -f "$CONF"
 rm -rf $W/db/* $W/spool/* $W/bk/*
 say "=== DONE ==="
+
+# ── scoring ────────────────────────────────────────────────────────────────
+# This suite used to print measurements only, so run_stress.sh could never score
+# it (always INCONCLUSIVE). Assert the property the suite exists to prove: the
+# tiered buffer must shorten how long the backup holds LOG_CS.
+FIXCS=$(grep -oE 'CS\[fix\]: LOG_CS held = [0-9.]+' $RES | tail -1 | grep -oE '[0-9.]+$')
+OFFCS=$(grep -oE 'CS\[off\]: LOG_CS held = [0-9.]+' $RES | tail -1 | grep -oE '[0-9.]+$')
+S10FAIL=0
+# OFF holding LOG_CS for the whole window (ENTER logged, no EXIT) is the
+# STRONGEST evidence for the mitigation, not a measurement failure.
+OFF_UNBOUNDED=$(grep -c 'CS\[off\]: LOG_CS ENTER logged, NO EXIT' $RES)
+if [ -n "$FIXCS" ] && [ "$OFF_UNBOUNDED" -gt 0 ]; then
+  echo "  [OK] LOG_CS held ${FIXCS}s with buffering; without buffering it was still held at end of window" | tee -a $RES
+elif [ -n "$FIXCS" ] && [ -n "$OFFCS" ]; then
+  # require a real margin: a near-tie on a single n=1 sample is not evidence
+  if awk -v a="$FIXCS" -v b="$OFFCS" 'BEGIN{exit !(b - a >= 0.5 || b > a * 1.5)}'; then
+    echo "  [OK] LOG_CS held ${FIXCS}s with buffering < ${OFFCS}s without" | tee -a $RES
+  elif awk -v a="$FIXCS" -v b="$OFFCS" 'BEGIN{exit !(a <= b)}'; then
+    echo "  [info] LOG_CS ${FIXCS}s vs ${OFFCS}s - no significant difference (n=1)" | tee -a $RES
+  else
+    echo "  [NOK] LOG_CS held ${FIXCS}s with buffering is HIGHER than ${OFFCS}s without" | tee -a $RES
+    S10FAIL=1
+  fi
+else
+  echo "  [NOK] LOG_CS hold time not measurable (fix='${FIXCS}' off='${OFFCS}')" | tee -a $RES
+  S10FAIL=1
+fi
+echo "RESULT: $([ $S10FAIL -eq 0 ] && echo ALL-PASS || echo FAIL)" | tee -a $RES
+[ $S10FAIL -eq 0 ] || exit 1

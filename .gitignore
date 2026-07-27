@@ -9,9 +9,9 @@
 core.node.*
 core.[0-9]*
 
-# --- Out-of-source build output ---
+# --- Out-of-source build output (build.sh creates build_<target>_<mode>) ---
 build/
-build_manual/
+build_*/
 
 # --- Compiled objects ---
 *.o
@@ -46,6 +46,7 @@ testcases/restore_dir/*
 testcases/CMakeCache.txt
 testcases/CMakeFiles/
 testcases/cmake_install.cmake
+testcases/CTestTestfile.cmake
 testcases/Makefile
 
 # --- testcases: package / results / scratch produced by run_test.sh ---

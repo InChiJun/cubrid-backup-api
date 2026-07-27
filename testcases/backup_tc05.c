@@ -45,7 +45,7 @@ int main (int argc, char *argv[])
 
     char *backup_data_buffer;
     int   backup_data_size = 0;
-    int   total_backup_data_size = 0;
+    long long total_backup_data_size = 0;
     int   backup_result;
 
     long  delay_us = 3000;
@@ -134,11 +134,11 @@ int main (int argc, char *argv[])
 
     if (0 == total_backup_data_size)
     {
-        printf ("[NOK] backup_data_size ==> %d\n", total_backup_data_size);
+        printf ("[NOK] backup_data_size ==> %lld\n", total_backup_data_size);
     }
     else
     {
-        printf ("[OK] backup_data_size ==> %d\n", total_backup_data_size);
+        printf ("[OK] backup_data_size ==> %lld\n", total_backup_data_size);
     }
 
     fclose (backup_fp);

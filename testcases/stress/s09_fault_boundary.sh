@@ -36,7 +36,12 @@ cp -r $SRC/src $W/injsrc/src
 awk -v hook="        if (getenv(\"CUB_BK_FORCE_PHASE_EARLY\") && !backup_handle->log_phase) { enter_log_phase (backup_handle); backup_handle->parser_on = false; }" \
   '{print} /long long disk_tail_offset = 0, disk_room = 0;/{print hook}' \
   $SRC/src/backup_core.c > $W/injsrc/src/backup_core.c
-echo "### hook injected: $(grep -c CUB_BK_FORCE_PHASE_EARLY $W/injsrc/src/backup_core.c) site(s)"
+_inj=$(grep -c CUB_BK_FORCE_PHASE_EARLY $W/injsrc/src/backup_core.c)
+echo "### hook injected: $_inj site(s)"
+# Without this the awk anchor can silently stop matching after a refactor: the
+# "injected" build would equal the control and the suite would PASS having
+# proved nothing.
+[ "$_inj" -eq 1 ] || { echo "  [NOK] wrong-phase hook NOT injected ($_inj sites) - test would be vacuous"; exit 1; }
 grep -q 'stdlib.h' $W/injsrc/src/backup_core.c || sed -i '1i #include <stdlib.h>' $W/injsrc/src/backup_core.c
 
 # 2) build INJECTED .so (from copy) and CONTROL .so (from clean feature source)
@@ -96,9 +101,10 @@ INJ=$(run_case injected libinj "CUB_BK_FORCE_PHASE_EARLY=1" | tail -1)
 
 cbad=${CTL%%|*}; ibad=${INJ%%|*}; irows=${INJ##*|}
 echo
-echo "### VERDICT:"
 if [ "$cbad" = 0 ] && [ "$ibad" = 0 ] && [ "$irows" = "$ROWS" ]; then
-  echo "  PASS — forced WRONG boundary still restores byte-intact (corrupted=0, rows=$irows==$ROWS); control also 0. Observational-safety property demonstrated."
+  echo "### VERDICT: PASS — forced WRONG boundary still restores byte-intact (corrupted=0, rows=$irows==$ROWS); control also 0."
 else
-  echo "  FAIL — control_corrupted=$cbad injected_corrupted=$ibad injected_rows=$irows expected=$ROWS"
+  echo "  [NOK] forced-boundary restore not byte-intact"
+  echo "### VERDICT: FAIL — control_corrupted=$cbad injected_corrupted=$ibad injected_rows=$irows expected=$ROWS"
+  exit 1
 fi

@@ -119,6 +119,6 @@ done
 echo | tee -a "$SUM"
 log "===== FINAL TABLE ====="
 cat "$TBL" | tee -a "$SUM"
-PASS=$(grep -cE '  *PASS' "$TBL"); TOT=$(wc -l < "$TBL")
+PASS=$(grep -cE "^\\S+ +PASS" "$TBL"); TOT=$(wc -l < "$TBL")
 log "===== $PASS/$TOT suite-runs PASS (full logs under $OUT) ====="
 [ "$PASS" = "$TOT" ]

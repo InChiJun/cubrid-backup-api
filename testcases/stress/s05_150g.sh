@@ -82,7 +82,9 @@ R "   final db size=$(du -sBG $W/db | cut -f1)"
 # integrity fingerprint: count|min|max (overflow-safe: SUM(a) hit -458 at 638M rows)
 # + sha256 of every-1000th row ordered. stderr kept in $W/v.err so a failing
 # query can never silently collapse the fingerprint again.
-V(){ csql -u dba -N -c "SELECT COUNT(*), MIN(a), MAX(a) FROM t" $DB 2>>$W/v.err | grep -E '[0-9]' | tr -s ' ' '|'
+s05_live(){ timeout 5 csql -u dba -N -c "SELECT 1 FROM db_root" $DB 2>/dev/null | grep -qE '^[[:space:]]*[0-9]+'; }
+s05_wait_db(){ local _e=$((SECONDS+600)); while [ $SECONDS -lt $_e ]; do s05_live && return 0; sleep 2; done; return 1; }
+V(){ csql -u dba -N -c "SELECT COUNT(*), MIN(a), MAX(a) FROM t" $DB 2>>$W/v.err | grep -vE 'rows? selected|Committed|^===' | grep -E '[0-9]' | tr -s ' ' '|'
      csql -u dba -N -c "SELECT a,b FROM t WHERE MOD(a,1000)=0 ORDER BY a" $DB 2>>$W/v.err | grep -vE 'rows selected|Committed|^[[:space:]]*$' | sha256sum | awk '{print $1}'; }
 
 declare -A FP
@@ -118,7 +120,17 @@ for L in 2 1 0; do
   rm -f $W/db/${DB} $W/db/${DB}_* $W/db/${DB}.* 2>/dev/null
   t0=$(date +%s)
   printf '0\n0\n0\n0\n0\n0\n' | cubrid restoredb -B $W/bk -l $L $DB > $W/restore_l$L.out 2>&1
+  rrc=${PIPESTATUS[1]}
+  # Distinguish "restore never ran" from "data differs": without this an aborted
+  # restore surfaces later as a fingerprint MISMATCH, i.e. reads as corruption.
+  if grep -qE 'Unable to mount|Backup volume|not found|following' $W/restore_l$L.out; then
+    nok "restore -l $L ABORTED (prompted for a volume this harness never produced); see restore_l$L.out"; continue
+  fi
+  if [ "$rrc" -ne 0 ]; then nok "restore -l $L failed rc=$rrc; see restore_l$L.out"; continue; fi
   cubrid server start $DB >/dev/null 2>&1
+  # Readiness gate: querying before the server is up yields a degenerate
+  # fingerprint that mismatches byte-identical data.
+  s05_wait_db "restore -l $L" || { nok "restore -l $L: server not ready"; continue; }
   t1=$(date +%s)
   FPR=$(V | tr '\n' '/')
   [ "$FPR" = "${FP[$L]}" ] && ok "restore -l $L fingerprint match ($((t1-t0))s)" \

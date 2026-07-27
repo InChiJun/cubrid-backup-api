@@ -56,7 +56,13 @@ buffer_disk_path=$W/spool
 buffer_disk_keep_spool=false
 E
 }
-dump(){ csql -u dba -N -c "SELECT a,b FROM t ORDER BY a" $DB 2>/dev/null | grep -vE 'rows selected|Committed|^[[:space:]]*$'; }
+# Liveness gate: without it a dead DB makes csql print the SAME error text for the
+# "before" and "after" capture, so their hashes match and a broken run reads as OK.
+live(){ timeout 5 csql -u dba -N -c "SELECT 1 FROM db_root" $DB 2>/dev/null | grep -qE '^[[:space:]]*[0-9]+'; }
+wait_db(){ local _end=$((SECONDS+60)); while [ $SECONDS -lt $_end ]; do live && return 0; sleep 1; done; nok "DB not live after 60s ($1)"; return 1; }
+# When the DB is down emit a unique marker so the comparison FAILS loudly instead
+# of two identical error strings comparing equal.
+dump(){ live || { echo "__DB_NOT_LIVE__$(date +%s%N)"; return; }; csql -u dba -N -c "SELECT a,b FROM t ORDER BY a" $DB 2>/dev/null | grep -vE 'rows selected|Committed|^[[:space:]]*$'; }
 wait_to(){ local pid=$1 to=$2 i=0
   while kill -0 $pid 2>/dev/null; do i=$((i+1)); [ $i -ge $((to*10)) ] && { kill -9 $pid 2>/dev/null; WRC=124; return; }; sleep 0.1; done
   wait $pid; WRC=$?; }
@@ -69,6 +75,7 @@ R "0. DB + L0 baseline (needed before incremental levels)"
 cubrid server stop $DB >/dev/null 2>&1; cubrid deletedb $DB >/dev/null 2>&1; rm -rf $W/db/*
 cubrid createdb -r --db-volume-size=300M --log-volume-size=100M $DB en_US >/dev/null 2>&1 || { echo CREATEDB_FAIL; exit 1; }
 cubrid server start $DB >/dev/null 2>&1
+wait_db "server start"
 { echo "CREATE TABLE t(a INT PRIMARY KEY, b VARCHAR(200));"; echo "INSERT INTO t VALUES (1,'s');";
   for i in $(seq 1 18); do echo "INSERT INTO t SELECT a+(SELECT MAX(a) FROM t), b FROM t;"; done;
   echo "UPDATE t SET b=RPAD(TO_CHAR(a),190,CHR(65+MOD(a,26)));"; } | csql -u dba $DB >/dev/null 2>&1
@@ -97,6 +104,7 @@ for L in 1 2; do
       || { sz=$(stat -c%s $W/bk/g_b 2>/dev/null||echo 0); [ "$sz" -gt 25000000 ] && ok "L$L stream finished pre-injection ($sz)" || nok "L$L rc=$WRC sz=$sz"; }
   else nok "L$L could not catch producer"; fi
   cubrid server start $DB >/dev/null 2>&1
+wait_db "server start"
 
   R "=== G1-L$L-c: undersized spool (4MB) at level $L — complete + restorable ==="
   wconf 1MB 4MB
@@ -112,6 +120,7 @@ cubrid server stop $DB >/dev/null 2>&1
 rm -f $W/db/${DB} $W/db/${DB}_* $W/db/${DB}.* 2>/dev/null
 printf '0\n0\n0\n0\n0\n0\n' | cubrid restoredb -B $W/bk -l 2 $DB > $W/restore.out 2>&1
 cubrid server start $DB >/dev/null 2>&1
+wait_db "server start"
 HR=$(dump | sha256sum | awk '{print $1}')
 [ "$HR" = "$H_FIN" ] && ok "G1 -l 2 chain restore hash matches" || nok "G1 chain restore MISMATCH"
 
@@ -130,6 +139,7 @@ cubrid server stop $DB >/dev/null 2>&1
 rm -f $W/db/${DB} $W/db/${DB}_* $W/db/${DB}.* 2>/dev/null
 printf '0\n0\n0\n0\n' | cubrid restoredb -B $W/ds1 -l 0 $DB > $W/restore_s1.out 2>&1
 cubrid server start $DB >/dev/null 2>&1
+wait_db "server start"
 HS_R=$(dump | sha256sum | awk '{print $1}')
 [ "$HS_R" = "$H_S" ] && ok "S1 restore hash matches (probe/carry byte-exact)" || nok "S1 HASH MISMATCH"
 
