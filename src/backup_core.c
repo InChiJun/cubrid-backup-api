@@ -287,7 +287,7 @@ int check_backup_info (CUBRID_BACKUP_INFO* backup_info)
         goto error;
     }
 
-    if (strlen (backup_info->db_name) > MAX_DB_NAME_LEN)
+    if (strlen (backup_info->db_name) >= MAX_DB_NAME_LEN)
     {
         PRINT_LOG_ERR (ERR_INFO);
         goto error;
@@ -351,7 +351,7 @@ int set_backup_info (CUBRID_BACKUP_INFO* backup_info, BACKUP_HANDLE* backup_hand
         backup_handle->compress = backup_info->compress == 1 ? true : false;
     }
 
-    snprintf (backup_handle->db_name, MAX_DB_NAME_LEN + 1, "%s", backup_info->db_name);
+    snprintf (backup_handle->db_name, MAX_DB_NAME_LEN, "%s", backup_info->db_name);
 
     return SUCCESS;
 
@@ -405,7 +405,7 @@ int check_restore_info (CUBRID_RESTORE_INFO* restore_info)
         goto error;
     }
 
-    if (strlen (restore_info->db_name) > MAX_DB_NAME_LEN)
+    if (strlen (restore_info->db_name) >= MAX_DB_NAME_LEN)
     {
         PRINT_LOG_ERR (ERR_INFO);
         goto error;
@@ -433,7 +433,7 @@ int set_restore_info (CUBRID_RESTORE_INFO* restore_info, RESTORE_HANDLE* restore
 
     snprintf (restore_handle->backup_file_path, PATH_MAX, "%s", restore_info->backup_file_path);
 
-    snprintf (restore_handle->db_name, MAX_DB_NAME_LEN + 1, "%s", restore_info->db_name);
+    snprintf (restore_handle->db_name, MAX_DB_NAME_LEN, "%s", restore_info->db_name);
 
     return SUCCESS;
 

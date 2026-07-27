@@ -1,5 +1,8 @@
 # cubrid-backup-api
 
+> 이 문서는 이번에 추가된 **계층형 버퍼 + 로그 구간 파서**의 설계·설정·운영을 다룹니다.
+> 구조체/함수 시그니처/샘플 코드 등 **API 레퍼런스는 [README.md](README.md)** 를 참고하세요.
+
 *FIFO로 `cubrid backupdb`를 구동해 백업 이미지를 호출자에게 스트리밍하는 C API. 프로세스 내부에 **티어드 버퍼**와 관찰형 **로그 구간 파서**를 두어, 느린 백업 소비자가 서버를 지연시키지 않도록 한다.*
 
 **Languages:** [English](README.md) · 한국어(이 문서)
@@ -113,9 +116,6 @@ int cubrid_backup_finalize (void);
 
   스위트 ↔ 검증표 전체 매핑은 [`testcases/stress/README.md`](testcases/stress/README.md) 참조.
 
-## 검증 현황
-
-이 기능은 프로젝트 검증표의 시나리오 전반에서 검증되었습니다 — 11개 대분류 전부 통과: 단위 테스트, 설정 검증, 에러/비정상 주입, ~30&nbsp;GB 및 150&nbsp;GB 레벨별 정확성, NONE·LZ4 양쪽 스트림의 복원 정확도(16.7M행 전수 스캔), 개선 전 API 대비 차등 비교, 온디스크 로그 대비 로그 구간 내용 일치, 강제 오경계 바이트 무결성, 느린 소비자 하 `LOG_CS` 점유 / 최악 커밋 지연 감소. 이 증거를 재현하는 스위트는 [`testcases/stress/`](testcases/stress/)에 있습니다(스위트 ↔ 검증표 매핑은 해당 README 참조).
 
 ## 플랫폼 · 한계
 

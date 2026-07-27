@@ -7,7 +7,8 @@
 #include "cubrid_backup_format.h"
 
 /* The maximum length of database name is 17 in English. */
-#define MAX_DB_NAME_LEN 17
+/* For database name + @ + host name */
+#define MAX_DB_NAME_LEN 512
 
 typedef enum handle_type HANDLE_TYPE;
 enum handle_type
@@ -56,7 +57,7 @@ struct backup_handle
     int fifo_fd;
     char fifo_path[PATH_MAX];
 
-    char db_name[MAX_DB_NAME_LEN + 1];
+    char db_name[MAX_DB_NAME_LEN];
 
     /* ── tiered buffer ── */
     bool buffering_enabled;   /* true when mem_buf alloc succeeds; false = legacy direct-FIFO path */
@@ -116,7 +117,7 @@ struct restore_handle
     int restore_fd;
     char backup_file_path[PATH_MAX];
 
-    char db_name[MAX_DB_NAME_LEN + 1];
+    char db_name[MAX_DB_NAME_LEN];
 };
 
 typedef struct handle_manager HANDLE_MANAGER;
