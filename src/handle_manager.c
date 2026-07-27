@@ -79,6 +79,8 @@ int initialize_backup_handle (BACKUP_HANDLE* backup_handle)
 {
     backup_handle->backup_thread_state = THREAD_STATE_NO_SPAWN;
 
+    backup_handle->backup_thread_started = false;
+
     backup_handle->is_cancel = false;
 
     backup_handle->backup_level   = BACKUP_FULL_LEVEL;
@@ -141,9 +143,14 @@ int initialize_backup_handle (BACKUP_HANDLE* backup_handle)
 static
 int finalize_backup_handle (BACKUP_HANDLE* backup_handle)
 {
-    if (backup_handle->backup_thread_state == THREAD_STATE_RUNNING)
+    /* Join on "was created", not on THREAD_STATE: a state-gated join is skipped
+     * on the normal path and leaks the thread. */
+    if (backup_handle->backup_thread_started)
     {
-        backup_handle->is_cancel = true;
+        if (backup_handle->backup_thread_state == THREAD_STATE_RUNNING)
+        {
+            backup_handle->is_cancel = true;
+        }
 
         // We create the thread after changing its state, so a creation failure can hang.
         // (creation failed, yet the state is already THREAD_STATE_RUNNING)
@@ -156,6 +163,7 @@ int finalize_backup_handle (BACKUP_HANDLE* backup_handle)
         // initialize_backup_handle () function below.
         // This structural problem is left to be improved in a future version.
         pthread_join (backup_handle->backup_thread, NULL);
+        backup_handle->backup_thread_started = false;
     }
 
     /* tiered-buffer: wake a parked drain (cond_wait / poll) and join it BEFORE

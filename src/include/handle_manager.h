@@ -41,6 +41,10 @@ struct backup_handle
 
     volatile THREAD_STATE backup_thread_state;   /* read by drain for EOF classification */
 
+    /* backup_thread join guard: the thread publishes its terminal state before
+     * it finishes, so THREAD_STATE cannot tell whether a join is still owed. */
+    bool backup_thread_started;
+
     bool is_cancel;
 
     BACKUP_LEVEL backup_level;

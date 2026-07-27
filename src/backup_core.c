@@ -2056,6 +2056,9 @@ int begin_backup (CUBRID_BACKUP_INFO* backup_info, void** handle)
      * `case 1` (free_handle) only. */
     state = 2;
 
+    /* A joinable thread now exists: record it so teardown always joins it. */
+    backup_handle->backup_thread_started = true;
+
     /* ── tiered buffer setup (best-effort: on any failure degrade to the legacy
      * direct-FIFO read path via buffering_enabled=false — never fail begin) ── */
     if (backup_mgr->default_backup_option.buffer_memory_size > 0)
@@ -2180,6 +2183,7 @@ error:
         case 2:
             backup_handle->is_cancel = true;
             pthread_join (backup_handle->backup_thread, NULL);
+            backup_handle->backup_thread_started = false;
             close_fifo (BACKUP_HANDLE_TYPE, backup_handle);
         case 1:
             free_handle (BACKUP_HANDLE_TYPE, backup_handle);
@@ -2241,15 +2245,21 @@ int end_backup (BACKUP_HANDLE* backup_handle)
 
     state = 1;
 
-    if (backup_handle->backup_thread_state == THREAD_STATE_RUNNING)
+    /* Join on "was created", not on THREAD_STATE (see handle_manager.c). */
+    if (backup_handle->backup_thread_started)
     {
-        backup_handle->is_cancel = true;
+        if (backup_handle->backup_thread_state == THREAD_STATE_RUNNING)
+        {
+            backup_handle->is_cancel = true;
+        }
 
         if (IS_FAILURE (pthread_join (backup_handle->backup_thread, NULL)))
         {
             PRINT_LOG_ERR (ERR_INFO);
             goto error;
         }
+
+        backup_handle->backup_thread_started = false;
     }
 
     /* Join the drain BEFORE close_fifo() (the drain reads fifo_fd). It was
