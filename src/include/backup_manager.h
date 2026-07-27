@@ -6,6 +6,19 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+
+/* F_SETPIPE_SZ / F_GETPIPE_SZ were added in Linux 2.6.35 and are absent from
+   the CUBRID build image (CentOS 6.10, glibc 2.12, kernel-headers 2.6.32), so
+   building there fails with "undeclared". They are ABI-stable kernel constants
+   (F_LINUX_SPECIFIC_BASE 1024 + 7/8) and the syscall works at runtime on any
+   kernel >= 2.6.35, so define them only when the platform headers omit them. */
+#ifndef F_SETPIPE_SZ
+#define F_SETPIPE_SZ 1031
+#endif
+#ifndef F_GETPIPE_SZ
+#define F_GETPIPE_SZ 1032
+#endif
+
 #include <dlfcn.h>
 #include "backup_common.h"
 
