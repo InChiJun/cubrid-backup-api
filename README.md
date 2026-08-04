@@ -191,19 +191,6 @@ flowchart TB
 
 6번은 API의 역할이 아니라 CUBRID 유틸리티의 역할입니다. 현재 버전은 백업 데이터를 데이터베이스에 직접 반영하는 `RESTORE_TO_DB` 방식을 지원하지 않습니다.
 
-### 2.5 동시성 계약 (내부 동작)
-
-> 이 절은 라이브러리를 사용하는 데 반드시 알아야 하는 내용은 아니고, drain 스레드가 내부적으로 어떻게 안전하게 동작하는지를 설명합니다. 동작 방식이 궁금하거나 라이브러리를 수정할 때 참고하십시오.
-> 
-
-계층형 버퍼는 **단일 생산자(drain 스레드) / 단일 소비자(`cubrid_backup_read`)** 구조입니다. 이 부분이 틀리면 서버가 hang하므로, 내부 규약을 명시해 둡니다.
-
-- **락.** 버퍼 락은 `buf_lock` 하나뿐입니다. 링 인덱스, `producer_eof` / `buf_error` / `stop` 플래그, 조건 변수 두 개(`not_empty`, `not_full`)를 모두 이 락이 보호합니다. 별도의 `backup_mutex`는 소비자 호출을 직렬화하고 종료(teardown)를 보호합니다. 락 획득 순서는 항상 `backup_mutex → buf_lock`입니다. **소비자(reader)는 `backup_mutex`를 쥔 채** `not_empty`를 기다리며(`cond_wait` 동안 `buf_lock`만 놓임), **drain 스레드는 `buf_lock`만** 잡습니다 — 종료 시 `buf_lock`으로 먼저 깨운 뒤에야 `backup_mutex`를 잡는(다음 불릿) 이유가 바로 이것입니다.
-- **drain 루프.** drain 스레드는 FIFO와 취소용 `eventfd`를 함께 `poll()`합니다(타임아웃 폴링·busy-spin 없음). 연속된 빈 공간을 예약하고(링의 끝을 넘는 경우 두 번의 `read`로 나뉨), **락 밖에서** 링으로 `read()`한 뒤(SPSC, 복사 1회), `buf_lock` 안에서 채운 바이트 수를 반영하고 `not_empty`를 신호합니다.
-- **취소 / 종료 (교착 없음).** `cubrid_backup_end()`는 **먼저** `buf_lock`만으로 신호합니다 — `stop`을 세우고, 정상 EOF가 아니면 `buf_error`를 세워(취소·절단된 백업을 성공으로 보고하지 않도록) 두 조건 변수를 broadcast한 뒤 `eventfd`에 씁니다. **그 다음에야** `backup_mutex`를 잡아 drain 스레드를 join하고 자원을 해제합니다. `cond_wait`에 걸려 있던 소비자는 깨어나 `buf_error`를 보고 실패를 반환하며 `backup_mutex`를 놓으므로, hang 없이 종료가 진행됩니다.
-- **SIGCHLD 격리.** drain 스레드에서 `SIGCHLD`를 블록해, 백업 워커의 `sigtimedwait`가 `cubrid backupdb` 자식 프로세스를 회수하도록 합니다. 그렇지 않으면 스트림 종료가 영영 감지되지 않습니다.
-- **EOF 판정.** `read()`가 0을 돌려주면 `buf_lock` 안에서 판정합니다 — 워커가 정상 종료했으면 `producer_eof`, 오류로 끝났거나 취소되었으면 `buf_error`, 아직 확정할 수 없으면 짧고 유한한 `eventfd` 재확인 후 결정합니다. 소비자에게 백업 종료는 정확히 한 번(마지막의 0바이트 성공)만 보고되며, 데이터와 동시에 보고되지 않습니다.
-
 ---
 
 ## 3. 설정 (cubrid_backup.conf)
