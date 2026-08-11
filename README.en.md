@@ -227,7 +227,7 @@ The syntax rules are as follows.
 | Boolean values | `true`, `false`, `1`, `0` (case-insensitive). |
 | Size values | A number optionally followed by `KB`, `MB`, or `GB` (1024-based, case-insensitive). Without a suffix the value is in bytes. |
 
-> **Caution** An unrecognised key, an entry that appears before any section header, or a malformed value causes `cubrid_backup_initialize()` to fail. Typos surface immediately rather than being silently ignored.
+> **Caution** An unrecognised (but well-formed) key, an entry that appears before any section header, or a value of the wrong type causes `cubrid_backup_initialize()` to fail. A value containing disallowed characters, or a line that does not parse as `key = value`, is silently ignored and its default is kept — so a typo can slip through unnoticed.
 
 ### 3.2 [backup] — backup behaviour
 
@@ -323,7 +323,8 @@ Where each setting can be specified:
 | `buffer_memory_size` is non-zero but below the I/O unit | `cubrid_backup_initialize()` fails |
 | `buffer_disk_limit > 0` while `buffer_memory_size = 0` | `cubrid_backup_initialize()` fails |
 | `buffer_disk_path` is missing or inaccessible | `cubrid_backup_initialize()` fails |
-| Unrecognised key, entry outside a section, or malformed value | `cubrid_backup_initialize()` fails |
+| Unrecognised (but well-formed) key, entry outside a section, or wrong-type value | `cubrid_backup_initialize()` fails |
+| Value with disallowed characters, or a line not in `key = value` form | Silently ignored, default kept |
 
 > **Caution** The conditions that fail immediately do so to avoid discovering a configuration mistake halfway through a backup. Always check the return value of `cubrid_backup_initialize()` after changing the configuration.
 

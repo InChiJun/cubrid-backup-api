@@ -227,7 +227,7 @@ partial_recovery=false
 | 불리언 값 | `true`, `false`, `1`, `0` (대소문자 무시) |
 | 크기 값 | 숫자 뒤에 `KB`, `MB`, `GB` 를 붙일 수 있습니다(1024 기준, 대소문자 무시). 접미사를 생략하면 바이트입니다. |
 
-> **주의** 정의되지 않은 키를 쓰거나, 섹션 헤더보다 앞에 항목을 쓰거나, 값 형식이 잘못되면 `cubrid_backup_initialize()`가 실패합니다. 오타가 조용히 무시되지 않고 즉시 드러나는 구조입니다.
+> **주의** 정의되지 않은(형식은 올바른) 키를 쓰거나, 섹션 헤더보다 앞에 항목을 쓰거나, 값의 타입이 틀리면 `cubrid_backup_initialize()`가 실패합니다. 다만 허용되지 않는 문자가 든 값이나 `키 = 값` 형식으로 파싱되지 않는 줄은 경고 없이 무시되어 기본값으로 동작하므로, 오타가 조용히 넘어갈 수 있음에 유의하십시오.
 
 ### 3.2 [backup] — 백업 동작 설정
 
@@ -323,7 +323,8 @@ partial_recovery=false
 | `buffer_memory_size`가 `0`이 아니면서 I/O 단위 미만 | `cubrid_backup_initialize()` 실패 |
 | `buffer_disk_limit > 0`인데 `buffer_memory_size = 0` | `cubrid_backup_initialize()` 실패 |
 | `buffer_disk_path`가 없거나 접근할 수 없음 | `cubrid_backup_initialize()` 실패 |
-| 정의되지 않은 키, 섹션 밖의 항목, 잘못된 값 형식 | `cubrid_backup_initialize()` 실패 |
+| 정의되지 않은(형식은 올바른) 키, 섹션 밖의 항목, 타입이 틀린 값 | `cubrid_backup_initialize()` 실패 |
+| 허용되지 않는 문자가 든 값, `키 = 값` 형식이 아닌 줄 | 경고 없이 무시하고 기본값 유지 |
 
 > **주의** 초기화 시점에 즉시 실패하는 항목들은 백업이 절반쯤 진행된 뒤에 문제가 드러나는 상황을 피하기 위한 것입니다. 설정을 바꾼 뒤에는 반드시 `cubrid_backup_initialize()`의 반환값을 확인하십시오.
 
