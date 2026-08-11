@@ -1321,6 +1321,7 @@ When a backup that used the tiered buffer finishes, a one-line summary is writte
 | `mem_high_water` | Peak memory ring usage, in bytes |
 | `disk_high_water` | Peak disk spool usage, in bytes |
 | `wait_count` | How often the buffer was full and had to wait. A high value suggests increasing the buffer sizes. |
+| `lookahead` | Number of probe reads taken to classify the log-phase boundary while the buffer was full, without waiting for the consumer |
 | `bytes_total` | Total bytes that passed through the buffer |
 
 ### 9.2 Common problems

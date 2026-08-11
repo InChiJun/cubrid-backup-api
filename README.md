@@ -1321,6 +1321,7 @@ CUBRID=/path/to/CUBRID bash run_stress.sh s01_param_sweep s09_fault_boundary   #
 | `mem_high_water` | 메모리 링 최대 사용량(바이트) |
 | `disk_high_water` | 디스크 스풀 최대 사용량(바이트) |
 | `wait_count` | 버퍼가 가득 차서 대기한 횟수. 값이 크면 버퍼 크기를 늘리는 것을 검토하십시오. |
+| `lookahead` | 로그 구간 경계를 판정하려고 버퍼가 가득 찬 동안 소비자를 기다리지 않고 파이프를 미리 읽은(probe) 횟수 |
 | `bytes_total` | 버퍼를 통과한 총 바이트 수 |
 
 ### 9.2 자주 발생하는 문제
