@@ -66,33 +66,18 @@ A build produces one header file and one shared library.
 
 Backup data flows out of the CUBRID server (`cub_server`), through a named pipe, and into the application. The components involved play distinctly different roles, so it helps to separate them first.
 
-```
-   Third-party backup program (user process)
-   ┌─────────────────────────────────────────────────────┐
-   │  application code                                   │
-   │        ▲                                            │
-   │        │  cubrid_backup_begin() / _read() / _end()  │
-   │        ▼                                            │
-   │  libcubridbackupapi.so   ←  cubrid_backup.conf      │
-   └───┬─────────────────────────────────────────────▲───┘
-       │ (1) fork + execv                            │ (4) cubrid_backup_read() reads
-       ▼                                             │
-   ┌─────────────────────────────────────┐           │
-   │  cubrid backupdb  (CUBRID utility)  │           │
-   │  relays the backup request only     │           │
-   └───┬─────────────────────────────────┘           │
-       │ (2) backup request (carries the FIFO path)  │
-       ▼                                             │
-   ┌─────────────────────────────────────┐           │
-   │  cub_server                         │           │
-   │    backup thread (logpb_backup)     │           │
-   └───┬─────────────────────────────────┘           │
-       │ (3) writes the backup data                  │
-       ▼                                             │
-   ┌─────────────────────────────────────────────────┴┐
-   │  named pipe (FIFO)                               │
-   │  $CUBRID/tmp/.cubrid_backup/<db>_bk<level>v000   │
-   └──────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    App["application code (third-party backup program)"]
+    API["libcubridbackupapi.so<br/>(reads cubrid_backup.conf)"]
+    BK["cubrid backupdb (CUBRID utility)<br/>relays the backup request only"]
+    SVR["cub_server backup thread<br/>(logpb_backup)"]
+    FIFO["named pipe (FIFO)<br/>$CUBRID/tmp/.cubrid_backup/&lt;db&gt;_bk&lt;level&gt;v000"]
+    App -->|"cubrid_backup_begin() / _read() / _end()"| API
+    API -->|"(1) fork + execv"| BK
+    BK -->|"(2) backup request (carries the FIFO path)"| SVR
+    SVR -->|"(3) writes the backup data"| FIFO
+    FIFO -->|"(4) cubrid_backup_read() reads"| App
 ```
 
 The roles are as follows.

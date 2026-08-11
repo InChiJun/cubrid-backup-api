@@ -66,33 +66,18 @@ CUBRID의 기본 백업 도구인 `cubrid backupdb`는 백업 이미지를 디�
 
 백업 데이터는 CUBRID 서버(`cub_server`)에서 named pipe를 거쳐 애플리케이션으로 흘러 나옵니다. 이때 각 구성 요소가 맡는 역할이 서로 다르므로, 먼저 그 역할을 구분해서 볼 필요가 있습니다.
 
-```
-   3rd party 백업 프로그램 (사용자 프로세스)
-   ┌─────────────────────────────────────────────────────┐
-   │  application code                                   │
-   │        ▲                                            │
-   │        │  cubrid_backup_begin() / _read() / _end()  │
-   │        ▼                                            │
-   │  libcubridbackupapi.so   ←  cubrid_backup.conf      │
-   └───┬─────────────────────────────────────────────▲───┘
-       │ ① fork + execv                              │ ④ cubrid_backup_read() 로 읽기
-       ▼                                             │
-   ┌──────────────────────────────────────┐          │
-   │  cubrid backupdb  (CUBRID 유틸리티)  │          │
-   │  서버에 백업 요청만 전달             │          │
-   └───┬──────────────────────────────────┘          │
-       │ ② 백업 요청 (FIFO 경로 전달)                │
-       ▼                                             │
-   ┌──────────────────────────────────────┐          │
-   │  cub_server                          │          │
-   │    백업 스레드 (logpb_backup)        │          │
-   └───┬──────────────────────────────────┘          │
-       │ ③ 백업 데이터 쓰기                          │
-       ▼                                             │
-   ┌─────────────────────────────────────────────────┴┐
-   │  named pipe (FIFO)                               │
-   │  $CUBRID/tmp/.cubrid_backup/<db>_bk<level>v000   │
-   └──────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    App["application code (3rd party 백업 프로그램)"]
+    API["libcubridbackupapi.so<br/>(cubrid_backup.conf 읽음)"]
+    BK["cubrid backupdb (CUBRID 유틸리티)<br/>서버에 백업 요청만 전달"]
+    SVR["cub_server 백업 스레드<br/>(logpb_backup)"]
+    FIFO["named pipe (FIFO)<br/>$CUBRID/tmp/.cubrid_backup/&lt;db&gt;_bk&lt;level&gt;v000"]
+    App -->|"cubrid_backup_begin() / _read() / _end()"| API
+    API -->|"① fork + execv"| BK
+    BK -->|"② 백업 요청 (FIFO 경로 전달)"| SVR
+    SVR -->|"③ 백업 데이터 쓰기"| FIFO
+    FIFO -->|"④ cubrid_backup_read() 로 읽기"| App
 ```
 
 역할을 정리하면 다음과 같습니다.
