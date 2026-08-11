@@ -334,14 +334,13 @@ For example, `compress` resolves as follows.
 | `compress=true` | `0` | no compression |
 | `compress=false` | `1` | compressed |
 
-The remaining settings can be specified in one place only.
+Where each setting can be specified:
 
-| Setting | Where it can be set |
+| Where it can be set | Settings |
 |---|---|
-| `backup_level`, `db_name` | API argument only |
-| `remove_archive`, `sa_mode`, `no_check`, `compress` | API argument or configuration file |
-| `thread_count`, `except_active_log`, `sleep_msecs` | Configuration file only |
-| `fifo_size`, `buffer_*` | Configuration file only |
+| API argument only | `backup_level`, `db_name` |
+| Configuration file + API argument | `remove_archive`, `sa_mode`, `no_check`, `compress` |
+| Configuration file only | all other `[backup]` · `[restore]` keys |
 
 ### 3.6 Behaviour on invalid configuration
 

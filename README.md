@@ -334,14 +334,13 @@ partial_recovery=false
 | `compress=true` | `0` | 압축하지 않음 |
 | `compress=false` | `1` | 압축 |
 
-나머지 항목은 지정할 수 있는 위치가 한 곳으로 정해져 있습니다.
+설정 위치는 다음과 같습니다.
 
-| 항목 | 설정 위치 |
+| 설정 위치 | 항목 |
 |---|---|
-| `backup_level`, `db_name` | API 인자만 |
-| `remove_archive`, `sa_mode`, `no_check`, `compress` | API 인자 또는 설정 파일 |
-| `thread_count`, `except_active_log`, `sleep_msecs` | 설정 파일만 |
-| `fifo_size`, `buffer_*` | 설정 파일만 |
+| API 인자만 | `backup_level`, `db_name` |
+| 설정 파일 + API 인자 | `remove_archive`, `sa_mode`, `no_check`, `compress` |
+| 설정 파일만 | 그 외 모든 `[backup]` · `[restore]` 키 |
 
 ### 3.6 잘못된 설정에 대한 동작
 
