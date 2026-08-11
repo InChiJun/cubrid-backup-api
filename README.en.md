@@ -141,30 +141,16 @@ The **log portion** of a backup (archive log plus active log) is copied while th
 
 To mitigate this, the API keeps a tiered buffer of its own. The drain thread keeps the pipe empty, so the server's backup thread proceeds without waiting and the consumer's slowness is absorbed inside the API instead.
 
+```mermaid
+flowchart TB
+    SVR["cub_server backup thread"] -->|"write()"| FIFO["FIFO (fifo_size)"]
+    FIFO -->|"kept empty by the drain thread"| MEM["memory ring (buffer_memory_size)<br/>older data"]
+    MEM -->|"overflow when the ring is full"| DISK["disk spool (buffer_disk_limit)<br/>newer data"]
+    MEM -->|"older data first"| READ["cubrid_backup_read()"]
+    DISK -->|"then newer data"| READ
 ```
-   cub_server backup thread
-                │ write()
-                ▼
-   ┌─────────────────────────┐
-   │  FIFO  (fifo_size)      │
-   └────────────┬────────────┘
-                │ kept empty by the drain thread
-                ▼
-   ┌─────────────────────────┐
-   │  memory ring            │  ← older data
-   │  (buffer_memory_size)   │
-   └────────────┬────────────┘
-                │ overflow when the ring is full
-                ▼
-   ┌─────────────────────────┐
-   │  disk spool             │  ← newer data
-   │  (buffer_disk_limit)    │
-   └────────────┬────────────┘
-                │
-   ◄────────────┘
-   cubrid_backup_read()
-   Memory is drained before disk, so byte order is always preserved.
-```
+
+*Memory is drained before disk, so byte order is always preserved.*
 
 Three operating modes follow from the configuration.
 
