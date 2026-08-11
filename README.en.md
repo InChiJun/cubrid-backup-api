@@ -718,7 +718,7 @@ sequenceDiagram
     API-->>App: 0
 
     App->>API: cubrid_restore_begin(restore_info, &handle)
-    API->>FS: create <path>/<db>_bk<level>v000
+    API->>FS: create &lt;path&gt;/&lt;db&gt;_bk&lt;level&gt;v000
     API-->>App: 0, handle
 
     loop until all backup data has been supplied
@@ -736,7 +736,7 @@ sequenceDiagram
     API-->>App: 0
 
     Note over App,UTIL: the API's role ends here
-    App->>UTIL: cubrid restoredb -B <dir> -l <level> <db_name>
+    App->>UTIL: cubrid restoredb -B &lt;dir&gt; -l &lt;level&gt; &lt;db_name&gt;
     UTIL-->>App: database restored
 ```
 

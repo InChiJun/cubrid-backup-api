@@ -718,7 +718,7 @@ sequenceDiagram
     API-->>App: 0
 
     App->>API: cubrid_restore_begin(restore_info, &handle)
-    API->>FS: <path>/<db>_bk<level>v000 생성
+    API->>FS: &lt;path&gt;/&lt;db&gt;_bk&lt;level&gt;v000 생성
     API-->>App: 0, handle
 
     loop 백업 데이터를 모두 전달할 때까지
@@ -736,7 +736,7 @@ sequenceDiagram
     API-->>App: 0
 
     Note over App,UTIL: API의 역할은 여기까지입니다
-    App->>UTIL: cubrid restoredb -B <dir> -l <level> <db_name>
+    App->>UTIL: cubrid restoredb -B &lt;dir&gt; -l &lt;level&gt; &lt;db_name&gt;
     UTIL-->>App: 데이터베이스 복구 완료
 ```
 
