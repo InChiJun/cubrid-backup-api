@@ -552,7 +552,6 @@ int cubrid_backup_read (void* backup_handle,
 **Usage notes**
 
 - **Decide when to stop from the return value only.** A return value of `1` can come with `data_len` equal to `0`; that only means no data was ready yet, not that the backup has finished, so keep calling.
-- A return value of `0` can come with a non-zero `data_len`. **Process that final chunk before leaving the loop.**
 - A `buffer_size` that is a multiple of the I/O unit (typically 32 KB) is most efficient. Smaller sizes work but increase the number of calls.
 - On `-1`, leave the loop, clean up with `cubrid_backup_end()`, and discard the data received.
 
