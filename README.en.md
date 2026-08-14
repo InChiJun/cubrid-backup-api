@@ -66,24 +66,12 @@ A build produces one header file and one shared library.
 
 Backup data flows out of the CUBRID server (`cub_server`), through a named pipe, and into the application. The components involved play distinctly different roles, so it helps to separate them first.
 
-```
-   third-party backup program (application code)
-        │  cubrid_backup_begin() / _read() / _end()
-        ▼
-   libcubridbackupapi.so  (reads cubrid_backup.conf)
-        │  (1) fork + execv
-        ▼
-   cubrid backupdb (CUBRID utility, relays the backup request only)
-        │  (2) backup request (carries the FIFO path)
-        ▼
-   cub_server backup thread (logpb_backup)
-        │  (3) writes the backup data
-        ▼
-   named pipe (FIFO)  $CUBRID/tmp/.cubrid_backup/<db>_bk<level>v000
-        │  (4) read by the application via cubrid_backup_read()
-        ▼
-   third-party backup program (data arrives)
-```
+The backup data follows this path.
+
+1. When the application calls `cubrid_backup_begin()`, `libcubridbackupapi.so` creates the named pipe and launches `cubrid backupdb` via `fork + execv`.
+2. `cubrid backupdb` passes the named pipe path to `cub_server` and requests a backup (its job ends once the request is relayed).
+3. The `cub_server` backup thread writes the backup data to the named pipe (`$CUBRID/tmp/.cubrid_backup/<db>_bk<level>v000`).
+4. The application reads that data via `cubrid_backup_read()`.
 
 The roles are as follows.
 
@@ -146,22 +134,13 @@ The **log portion** of a backup (archive log plus active log) is copied while th
 
 To mitigate this, the API keeps a tiered buffer of its own. The drain thread keeps the pipe empty, so the server's backup thread proceeds without waiting and the consumer's slowness is absorbed inside the API instead.
 
-```
-   cub_server backup thread
-        │ write()
-        ▼
-   FIFO (fifo_size)
-        │ drained continuously by the drain thread
-        ▼
-   memory ring (buffer_memory_size)   ← older data
-        │ overflow when the ring is full
-        ▼
-   disk spool (buffer_disk_limit)     ← newer data
-        │
-        └─► cubrid_backup_read()
-```
+The drain thread keeps the named pipe empty, staging data in the order below, and the consumer receives the oldest data first.
 
-*Memory is drained before disk, so byte order is always preserved.*
+1. `cub_server` writes backup data to the named pipe (FIFO, `fifo_size`).
+2. The drain thread empties the FIFO into the **memory ring** (`buffer_memory_size`) — older data.
+3. When the memory ring fills up, data overflows to the **disk spool** (`buffer_disk_limit`) — newer data.
+4. `cubrid_backup_read()` pops from memory (older) first, then disk (newer), so byte order is always preserved.
+
 
 Three operating modes follow from the configuration.
 
@@ -670,84 +649,38 @@ Where section 2 illustrates the concepts, this section shows **which functions t
 
 ### 6.1 Backup — call sequence
 
-```
-App  → API    cubrid_backup_initialize()
-                (internal) open the diagnostic log, prepare the working dir, read/validate cubrid_backup.conf
-API  → App    0
-
-App  → API    cubrid_backup_begin(backup_info, &handle)
-                (internal) create the named pipe, open its read end, pipe buffer = fifo_size
-API  → BK     fork + execv (cubrid backupdb -D named_pipe ...)
-API  → Drain  start the drain thread (when buffering is on)
-API  → App    0, handle
-
-BK   → SVR    backup request (carries the named pipe path)  — BK's job ends once relayed
-
-[while the backup runs, loop]
-  SVR → Drain   write backup data to the named pipe
-                  (internal) fill the memory ring; overflow to the disk spool
-
-[while the return value is 1, loop]
-  App → API     cubrid_backup_read(handle, buf, size, &len)
-  API → Drain   pop oldest-first from the buffer
-  API → App     1, len  (more data remains)
-  App           send the data to the storage medium
-
-App  → API    cubrid_backup_read(handle, buf, size, &len)
-API  → App    0  (backup complete)
-
-App  → API    cubrid_backup_end(handle)
-                (internal) reap backupdb, join the drain thread, remove the named pipe
-API  → App    0
-
-App  → API    cubrid_backup_finalize()
-API  → App    0
-```
+1. `cubrid_backup_initialize()` — open the diagnostic log, prepare the working directory, read/validate `cubrid_backup.conf`. Returns `0`.
+2. `cubrid_backup_begin(backup_info, &handle)` — create the named pipe and open its read end (pipe buffer = `fifo_size`), launch `cubrid backupdb` via `fork + execv`, and start the drain thread when buffering is on. Returns `0` and `handle`.
+3. `cubrid backupdb` passes the named pipe path to `cub_server` and requests a backup.
+4. The `cub_server` backup thread writes backup data to the named pipe; the drain thread reads it continuously into the memory ring and disk spool.
+5. Call `cubrid_backup_read(handle, buf, size, &len)` repeatedly. While it returns `1`, more data remains — send `len` bytes to the storage medium and call again.
+6. A return value of `0` means the backup is complete.
+7. `cubrid_backup_end(handle)` — reap `cubrid backupdb`, join the drain thread, remove the named pipe. Returns `0`.
+8. `cubrid_backup_finalize()` — clean up the working directory, close the diagnostic log. Returns `0`.
 
 ### 6.2 Restore — call sequence
 
-```
-App  → API    cubrid_backup_initialize()
-API  → App    0
-
-App  → API    cubrid_restore_begin(restore_info, &handle)
-API  → FS     create <path>/<db>_bk<level>v000
-API  → App    0, handle
-
-[until all backup data has been supplied, loop]
-  App           read backup data from the storage medium
-  App → API     cubrid_restore_write(handle, level, buf, len)
-  API → FS      append to the file in order
-  API → App     0
-
-App  → API    cubrid_restore_end(handle)
-API  → FS     close the file
-API  → App    0
-
-App  → API    cubrid_backup_finalize()
-API  → App    0
-
-── the API's role ends here ──
-App  → (CUBRID cmd)   cubrid restoredb -B <dir> -l <level> <db_name>
-                      → database restored
-```
+1. `cubrid_backup_initialize()`. Returns `0`.
+2. `cubrid_restore_begin(restore_info, &handle)` — creates the `<path>/<db>_bk<level>v000` file. Returns `0` and `handle`.
+3. Read backup data from the storage medium in the same order it was read during backup, and call `cubrid_restore_write(handle, level, buf, len)` repeatedly. The API appends to the file in order; each call returns `0`.
+4. `cubrid_restore_end(handle)` — closes the file. Returns `0`.
+5. `cubrid_backup_finalize()`. Returns `0`.
+6. The API's role ends here. To restore the actual database from the reconstructed backup volume file, use the CUBRID command `cubrid restoredb -B <dir> -l <level> <db_name>`.
 
 ### 6.3 Internal state transitions
 
 The API keeps a single internal state. A call that does not match the current state returns `-1`.
 
-```mermaid
-stateDiagram-v2
-    [*] --> NOT_READY
-    NOT_READY --> READY : cubrid_backup_initialize()
-    READY --> BACKUP : cubrid_backup_begin()
-    BACKUP --> READY : cubrid_backup_end()
-    READY --> RESTORE : cubrid_restore_begin()
-    RESTORE --> READY : cubrid_restore_end()
-    READY --> NOT_READY : cubrid_backup_finalize()
-    BACKUP --> NOT_READY : cubrid_backup_finalize()
-    RESTORE --> NOT_READY : cubrid_backup_finalize()
-```
+The initial state is `NOT_READY`. State transitions are as follows.
+
+| Current state | Call | Next state |
+|---|---|---|
+| `NOT_READY` | `cubrid_backup_initialize()` | `READY` |
+| `READY` | `cubrid_backup_begin()` | `BACKUP` |
+| `BACKUP` | `cubrid_backup_end()` | `READY` |
+| `READY` | `cubrid_restore_begin()` | `RESTORE` |
+| `RESTORE` | `cubrid_restore_end()` | `READY` |
+| `READY` · `BACKUP` · `RESTORE` | `cubrid_backup_finalize()` | `NOT_READY` |
 
 `cubrid_backup_read()` is valid only in the `BACKUP` state, and `cubrid_restore_write()` only in the `RESTORE` state.
 
