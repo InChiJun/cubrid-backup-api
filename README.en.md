@@ -66,18 +66,23 @@ A build produces one header file and one shared library.
 
 Backup data flows out of the CUBRID server (`cub_server`), through a named pipe, and into the application. The components involved play distinctly different roles, so it helps to separate them first.
 
-```mermaid
-flowchart TB
-    App["application code (third-party backup program)"]
-    API["libcubridbackupapi.so<br/>(reads cubrid_backup.conf)"]
-    BK["cubrid backupdb (CUBRID utility)<br/>relays the backup request only"]
-    SVR["cub_server backup thread<br/>(logpb_backup)"]
-    FIFO["named pipe (FIFO)<br/>$CUBRID/tmp/.cubrid_backup/&lt;db&gt;_bk&lt;level&gt;v000"]
-    App -->|"cubrid_backup_begin() / _read() / _end()"| API
-    API -->|"(1) fork + execv"| BK
-    BK -->|"(2) backup request (carries the FIFO path)"| SVR
-    SVR -->|"(3) writes the backup data"| FIFO
-    FIFO -->|"(4) cubrid_backup_read() reads"| App
+```
+   third-party backup program (application code)
+        │  cubrid_backup_begin() / _read() / _end()
+        ▼
+   libcubridbackupapi.so  (reads cubrid_backup.conf)
+        │  (1) fork + execv
+        ▼
+   cubrid backupdb (CUBRID utility, relays the backup request only)
+        │  (2) backup request (carries the FIFO path)
+        ▼
+   cub_server backup thread (logpb_backup)
+        │  (3) writes the backup data
+        ▼
+   named pipe (FIFO)  $CUBRID/tmp/.cubrid_backup/<db>_bk<level>v000
+        │  (4) read by the application via cubrid_backup_read()
+        ▼
+   third-party backup program (data arrives)
 ```
 
 The roles are as follows.
@@ -97,9 +102,9 @@ Restore runs in the opposite direction. The application hands its stored backup 
 
 ```
  1. cubrid_backup_initialize()
-      Read and validate cubrid_backup.conf
       Open the API diagnostic log file ($CUBRID/log/cubrid_backup.log)
       Prepare the temporary working directory
+      Read and validate cubrid_backup.conf
 
  2. cubrid_backup_begin()
       Create the named pipe ──► $CUBRID/tmp/.cubrid_backup/<db>_bk<level>v000
@@ -121,7 +126,7 @@ Restore runs in the opposite direction. The application hands its stored backup 
       return value 0: backup complete
 
  6. cubrid_backup_end()
-      Stop and join the drain thread, reap the cubrid backupdb process, remove the named pipe
+      Reap the cubrid backupdb process, join the drain thread, remove the named pipe
 
  7. cubrid_backup_finalize()
       Clean up the temporary working directory, close the API diagnostic log file
@@ -141,13 +146,19 @@ The **log portion** of a backup (archive log plus active log) is copied while th
 
 To mitigate this, the API keeps a tiered buffer of its own. The drain thread keeps the pipe empty, so the server's backup thread proceeds without waiting and the consumer's slowness is absorbed inside the API instead.
 
-```mermaid
-flowchart TB
-    SVR["cub_server backup thread"] -->|"write()"| FIFO["FIFO (fifo_size)"]
-    FIFO -->|"kept empty by the drain thread"| MEM["memory ring (buffer_memory_size)<br/>older data"]
-    MEM -->|"overflow when the ring is full"| DISK["disk spool (buffer_disk_limit)<br/>newer data"]
-    MEM -->|"older data first"| READ["cubrid_backup_read()"]
-    DISK -->|"then newer data"| READ
+```
+   cub_server backup thread
+        │ write()
+        ▼
+   FIFO (fifo_size)
+        │ drained continuously by the drain thread
+        ▼
+   memory ring (buffer_memory_size)   ← older data
+        │ overflow when the ring is full
+        ▼
+   disk spool (buffer_disk_limit)     ← newer data
+        │
+        └─► cubrid_backup_read()
 ```
 
 *Memory is drained before disk, so byte order is always preserved.*
@@ -222,7 +233,7 @@ The syntax rules are as follows.
 | Entries | `key = value`. Whitespace around `=` is allowed. |
 | Key characters | Letters and `_` only. Case-insensitive. |
 | Value characters | Alphanumerics and `/`, `.`, `_`, `-` only. **Spaces and other special characters are not allowed.** |
-| Comments | A line beginning with `#` is treated as a comment and ignored. To disable an entry temporarily, prefix the line with `#`, as in `#thread_count=8`. |
+| Comments | Prefixing a line with `#` makes that line ignored (e.g. `#thread_count=8` to disable an entry temporarily). There is no dedicated comment syntax — a line is simply ignored when it does not match `key = value`. **Inline comments are not supported.** Appending text after a value, as in `thread_count=8  # note`, makes the whole line silently ignored, so the entry stays at its default. |
 | Blank lines | Ignored. |
 | Boolean values | `true`, `false`, `1`, `0` (case-insensitive). |
 | Size values | A number optionally followed by `KB`, `MB`, or `GB` (1024-based, case-insensitive). Without a suffix the value is in bytes. |
@@ -659,85 +670,66 @@ Where section 2 illustrates the concepts, this section shows **which functions t
 
 ### 6.1 Backup — call sequence
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant App as Third-party program
-    participant API as libcubridbackupapi.so
-    participant Drain as drain thread
-    participant BK as cubrid backupdb
-    participant SVR as cub_server backup thread
+```
+App  → API    cubrid_backup_initialize()
+                (internal) open the diagnostic log, prepare the working dir, read/validate cubrid_backup.conf
+API  → App    0
 
-    App->>API: cubrid_backup_initialize()
-    Note over API: read and validate cubrid_backup.conf<br/>open the diagnostic log, prepare the working directory
-    API-->>App: 0
+App  → API    cubrid_backup_begin(backup_info, &handle)
+                (internal) create the named pipe, open its read end, pipe buffer = fifo_size
+API  → BK     fork + execv (cubrid backupdb -D named_pipe ...)
+API  → Drain  start the drain thread (when buffering is on)
+API  → App    0, handle
 
-    App->>API: cubrid_backup_begin(backup_info, &handle)
-    Note over API: create the named pipe and open its read end<br/>pipe buffer size = fifo_size
-    API->>BK: fork + execv (cubrid backupdb -D named_pipe ...)
-    API->>Drain: start the drain thread (when buffering is on)
-    API-->>App: 0, handle
+BK   → SVR    backup request (carries the named pipe path)  — BK's job ends once relayed
 
-    BK->>SVR: backup request (carries the named pipe path)
-    Note over BK: job done once the request is relayed
-    loop while the backup runs
-        SVR->>Drain: write backup data to the named pipe
-        Note over Drain: fill the memory ring<br/>overflow to the disk spool
-    end
+[while the backup runs, loop]
+  SVR → Drain   write backup data to the named pipe
+                  (internal) fill the memory ring; overflow to the disk spool
 
-    loop while the return value is 1
-        App->>API: cubrid_backup_read(handle, buf, size, &len)
-        API->>Drain: pop oldest-first from the buffer
-        API-->>App: 1, len (more data remains)
-        App->>App: send the data to the storage medium
-    end
+[while the return value is 1, loop]
+  App → API     cubrid_backup_read(handle, buf, size, &len)
+  API → Drain   pop oldest-first from the buffer
+  API → App     1, len  (more data remains)
+  App           send the data to the storage medium
 
-    Note over SVR: backup complete
-    App->>API: cubrid_backup_read(handle, buf, size, &len)
-    API-->>App: 0 (backup complete)
+App  → API    cubrid_backup_read(handle, buf, size, &len)
+API  → App    0  (backup complete)
 
-    App->>API: cubrid_backup_end(handle)
-    Note over API: stop and join the drain thread<br/>reap backupdb, remove the named pipe
-    API-->>App: 0
+App  → API    cubrid_backup_end(handle)
+                (internal) reap backupdb, join the drain thread, remove the named pipe
+API  → App    0
 
-    App->>API: cubrid_backup_finalize()
-    API-->>App: 0
+App  → API    cubrid_backup_finalize()
+API  → App    0
 ```
 
 ### 6.2 Restore — call sequence
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant App as Third-party program
-    participant API as libcubridbackupapi.so
-    participant FS as Backup volume file
-    participant UTIL as cubrid restoredb
+```
+App  → API    cubrid_backup_initialize()
+API  → App    0
 
-    App->>API: cubrid_backup_initialize()
-    API-->>App: 0
+App  → API    cubrid_restore_begin(restore_info, &handle)
+API  → FS     create <path>/<db>_bk<level>v000
+API  → App    0, handle
 
-    App->>API: cubrid_restore_begin(restore_info, &handle)
-    API->>FS: create &lt;path&gt;/&lt;db&gt;_bk&lt;level&gt;v000
-    API-->>App: 0, handle
+[until all backup data has been supplied, loop]
+  App           read backup data from the storage medium
+  App → API     cubrid_restore_write(handle, level, buf, len)
+  API → FS      append to the file in order
+  API → App     0
 
-    loop until all backup data has been supplied
-        App->>App: read backup data from the storage medium
-        App->>API: cubrid_restore_write(handle, level, buf, len)
-        API->>FS: append to the file in order
-        API-->>App: 0
-    end
+App  → API    cubrid_restore_end(handle)
+API  → FS     close the file
+API  → App    0
 
-    App->>API: cubrid_restore_end(handle)
-    API->>FS: close the file
-    API-->>App: 0
+App  → API    cubrid_backup_finalize()
+API  → App    0
 
-    App->>API: cubrid_backup_finalize()
-    API-->>App: 0
-
-    Note over App,UTIL: the API's role ends here
-    App->>UTIL: cubrid restoredb -B &lt;dir&gt; -l &lt;level&gt; &lt;db_name&gt;
-    UTIL-->>App: database restored
+── the API's role ends here ──
+App  → (CUBRID cmd)   cubrid restoredb -B <dir> -l <level> <db_name>
+                      → database restored
 ```
 
 ### 6.3 Internal state transitions
@@ -755,17 +747,9 @@ stateDiagram-v2
     READY --> NOT_READY : cubrid_backup_finalize()
     BACKUP --> NOT_READY : cubrid_backup_finalize()
     RESTORE --> NOT_READY : cubrid_backup_finalize()
-
-    note right of BACKUP
-        cubrid_backup_read() is valid
-        only in this state
-    end note
-
-    note right of RESTORE
-        cubrid_restore_write() is valid
-        only in this state
-    end note
 ```
+
+`cubrid_backup_read()` is valid only in the `BACKUP` state, and `cubrid_restore_write()` only in the `RESTORE` state.
 
 ### 6.4 Loop structure in pseudocode
 
